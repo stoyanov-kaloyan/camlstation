@@ -6,11 +6,22 @@ type registers = {
 }
 
 type cp0 = {
+  mutable index : int;
+  mutable random : int;
+  mutable entrylo0 : int;
+  mutable entrylo1 : int;
+  mutable context : int;
+  mutable pagemask : int;
+  mutable wired : int;
+  mutable badvaddr : int;
+  mutable count : int;
+  mutable entryhi : int;
+  mutable compare : int;
   mutable sr : int;
   mutable cause : int;
   mutable epc : int;
-  mutable badvaddr : int;
-  mutable context : int;
+  mutable prid : int;
+  mutable config : int;
 }
 
 type cpu_exception =
@@ -55,6 +66,10 @@ type instruction =
   | ADDIU of three
   | ADDU of three
   | SUBU of three
+  | SLT of three
+  | SLTU of three
+  | SLTI of three
+  | SLTIU of three
   | AND of three
   | ANDI of three
   | OR of three
@@ -64,7 +79,13 @@ type instruction =
   | XORI of three
   | SLL of three
   | LUI of two
+  | LB of three
+  | LBU of three
+  | LH of three
+  | LHU of three
   | LW of three
+  | SB of three
+  | SH of three
   | SW of three
   | BREAK
   | SYSCALL
@@ -102,11 +123,22 @@ let cpu_of_bios bios =
     regs = { gp = Array.make 32 0; hi = 0; lo = 0; delayed_branch = None };
     cp0 =
       {
-        sr = 0x00000000;
-        cause = 0x00000000;
-        epc = 0x00000000;
-        badvaddr = 0x00000000;
-        context = 0x00000000;
+        index = 0;
+        random = 0;
+        entrylo0 = 0;
+        entrylo1 = 0;
+        context = 0;
+        pagemask = 0;
+        wired = 0;
+        badvaddr = 0;
+        count = 0;
+        entryhi = 0;
+        compare = 0;
+        sr = 0;
+        cause = 0;
+        epc = 0;
+        prid = 0;
+        config = 0;
       };
   }
 
@@ -132,6 +164,33 @@ let write_word (bus : int array) (addr : int) (value : int) : unit =
   bus.(a1) <- (value lsr 8) land 0xFF;
   bus.(a2) <- (value lsr 16) land 0xFF;
   bus.(a3) <- (value lsr 24) land 0xFF
+
+let read_byte (bus : int array) (addr : int) : int =
+  let b = bus.(bus_addr addr) land 0xFF in
+  if b land 0x80 <> 0 then b lor lnot 0xFF else b
+
+let read_byte_u (bus : int array) (addr : int) : int =
+  bus.(bus_addr addr) land 0xFF
+
+let read_halfword (bus : int array) (addr : int) : int =
+  let a0 = bus_addr addr in
+  let a1 = bus_addr (addr + 1) in
+  let h = ((bus.(a1) land 0xFF) lsl 8) lor (bus.(a0) land 0xFF) in
+  if h land 0x8000 <> 0 then h lor lnot 0xFFFF else h
+
+let read_halfword_u (bus : int array) (addr : int) : int =
+  let a0 = bus_addr addr in
+  let a1 = bus_addr (addr + 1) in
+  ((bus.(a1) land 0xFF) lsl 8) lor (bus.(a0) land 0xFF)
+
+let write_byte (bus : int array) (addr : int) (value : int) : unit =
+  bus.(bus_addr addr) <- value land 0xFF
+
+let write_halfword (bus : int array) (addr : int) (value : int) : unit =
+  let a0 = bus_addr addr in
+  let a1 = bus_addr (addr + 1) in
+  bus.(a0) <- value land 0xFF;
+  bus.(a1) <- (value lsr 8) land 0xFF
 
 let mask16 imm = imm land 0xFFFF
 
@@ -226,11 +285,22 @@ let execute (cpu : cpu) (instr : instruction) : unit =
 
   let c0_of_reg (reg_num : int) : int =
     match reg_num with
+    | 0 -> cpu.cp0.index
+    | 1 -> cpu.cp0.random
+    | 2 -> cpu.cp0.entrylo0
+    | 3 -> cpu.cp0.entrylo1
+    | 4 -> cpu.cp0.context
+    | 5 -> cpu.cp0.pagemask
+    | 6 -> cpu.cp0.wired
+    | 8 -> cpu.cp0.badvaddr
+    | 9 -> cpu.cp0.count
+    | 10 -> cpu.cp0.entryhi
+    | 11 -> cpu.cp0.compare
     | 12 -> cpu.cp0.sr
     | 13 -> cpu.cp0.cause
     | 14 -> cpu.cp0.epc
-    | 8 -> cpu.cp0.badvaddr
-    | 4 -> cpu.cp0.context
+    | 15 -> cpu.cp0.prid
+    | 16 -> cpu.cp0.config
     | _ ->
         raise
           (Invalid_argument
@@ -239,11 +309,22 @@ let execute (cpu : cpu) (instr : instruction) : unit =
 
   let set_c0_reg (reg_num : int) (value : int) : unit =
     match reg_num with
+    | 0 -> cpu.cp0.index <- value
+    | 1 -> cpu.cp0.random <- value
+    | 2 -> cpu.cp0.entrylo0 <- value
+    | 3 -> cpu.cp0.entrylo1 <- value
+    | 4 -> cpu.cp0.context <- value
+    | 5 -> cpu.cp0.pagemask <- value
+    | 6 -> cpu.cp0.wired <- value
+    | 8 -> cpu.cp0.badvaddr <- value
+    | 9 -> cpu.cp0.count <- value
+    | 10 -> cpu.cp0.entryhi <- value
+    | 11 -> cpu.cp0.compare <- value
     | 12 -> cpu.cp0.sr <- value
     | 13 -> cpu.cp0.cause <- value
     | 14 -> cpu.cp0.epc <- value
-    | 8 -> cpu.cp0.badvaddr <- value
-    | 4 -> cpu.cp0.context <- value
+    | 15 -> cpu.cp0.prid <- value
+    | 16 -> cpu.cp0.config <- value
     | _ ->
         raise
           (Invalid_argument
@@ -341,10 +422,42 @@ let execute (cpu : cpu) (instr : instruction) : unit =
           exec_rtype (fun a b -> lnot (a lor b)) no_ovf rd rs rt
       | XOR (rd, rs, rt) -> exec_rtype ( lxor ) no_ovf rd rs rt
       | XORI (rt, rs, imm) -> exec_itype ( lxor ) no_ovf rt rs (mask16 imm)
+      | SLT (rd, rs, rt) ->
+          let res = if ext32 (get_reg rs) < ext32 (get_reg rt) then 1 else 0 in
+          set_reg rd res
+      | SLTU (rd, rs, rt) ->
+          let res =
+            if (get_reg rs land 0xFFFFFFFF) < (get_reg rt land 0xFFFFFFFF) then
+              1
+            else 0
+          in
+          set_reg rd res
+      | SLTI (rt, rs, imm) ->
+          let res = if ext32 (get_reg rs) < ext16 imm then 1 else 0 in
+          set_reg rt res
+      | SLTIU (rt, rs, imm) ->
+          let res =
+            if (get_reg rs land 0xFFFFFFFF) < (ext16 imm land 0xFFFFFFFF) then
+              1
+            else 0
+          in
+          set_reg rt res
       | SLL (rd, rt, shamt) -> set_reg rd ((get_reg rt lsl shamt) land 0xFFFFFFFF)
       | LUI (rt, imm) -> set_reg rt ((imm land 0xFFFF) lsl 16)
+      | LB (rt, rs, imm) ->
+          set_reg rt (read_byte cpu.bus (get_reg rs + ext16 imm))
+      | LBU (rt, rs, imm) ->
+          set_reg rt (read_byte_u cpu.bus (get_reg rs + ext16 imm))
+      | LH (rt, rs, imm) ->
+          set_reg rt (read_halfword cpu.bus (get_reg rs + ext16 imm))
+      | LHU (rt, rs, imm) ->
+          set_reg rt (read_halfword_u cpu.bus (get_reg rs + ext16 imm))
       | LW (rt, rs, imm) ->
           set_reg rt (read_word cpu.bus (get_reg rs + ext16 imm))
+      | SB (rt, rs, imm) ->
+          write_byte cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
+      | SH (rt, rs, imm) ->
+          write_halfword cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
       | SW (rt, rs, imm) ->
           write_word cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
       | BREAK -> raise_exception Break
@@ -385,7 +498,8 @@ let execute (cpu : cpu) (instr : instruction) : unit =
      cpu.pc <- next_pc
    with
    | CpuException _ -> ()
-   | Invalid_argument msg -> print_endline ("Error: " ^ msg))
+   (* Any other unexpected error (Invalid_argument, etc.) is fatal and
+      propagates so we do not silently skip broken instructions. *))
 
 
 exception UnknownOpcode of int
@@ -432,6 +546,8 @@ let parse_opcode (instr : int) : instruction =
       | 0b100101 -> OR (rd, rs, rt)
       | 0b100110 -> XOR (rd, rs, rt)
       | 0b100111 -> NOR (rd, rs, rt)
+      | 0b101010 -> SLT (rd, rs, rt)
+      | 0b101011 -> SLTU (rd, rs, rt)
       | 0b011000 -> MULT (rs, rt)
       | 0b011001 -> MULTU (rs, rt)
       | 0b011010 -> DIV (rs, rt)
@@ -448,11 +564,19 @@ let parse_opcode (instr : int) : instruction =
       | _ -> raise (UnknownFunction funct))
   | 0b001000 -> ADDI (rt, rs, imm)
   | 0b001001 -> ADDIU (rt, rs, imm)
+  | 0b001010 -> SLTI (rt, rs, imm)
+  | 0b001011 -> SLTIU (rt, rs, imm)
   | 0b001100 -> ANDI (rt, rs, imm)
   | 0b001101 -> ORI (rt, rs, imm)
   | 0b001110 -> XORI (rt, rs, imm)
   | 0b001111 -> LUI (rt, imm)
+  | 0b100000 -> LB (rt, rs, imm)
+  | 0b100100 -> LBU (rt, rs, imm)
+  | 0b100001 -> LH (rt, rs, imm)
+  | 0b100101 -> LHU (rt, rs, imm)
   | 0b100011 -> LW (rt, rs, imm)
+  | 0b101000 -> SB (rt, rs, imm)
+  | 0b101001 -> SH (rt, rs, imm)
   | 0b101011 -> SW (rt, rs, imm)
   | 0b000010 -> J target
   | 0b000011 -> JAL target
