@@ -405,122 +405,118 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     | None -> (cpu.pc + 4, false)
   in
   ignore in_delay_slot;
-  (try
-     (match instr with
-      | ADD (rd, rs, rt) -> exec_rtype ( + ) ovf_add rd rs rt
-      | SUB (rd, rs, rt) -> exec_rtype ( - ) ovf_sub rd rs rt
-      | ADDU (rd, rs, rt) -> exec_rtype ( + ) no_ovf rd rs rt
-      | SUBU (rd, rs, rt) -> exec_rtype ( - ) no_ovf rd rs rt
-      | MULT (rs, rt) -> exec_hilo mult_op rs rt
-      | MULTU (rs, rt) -> exec_hilo multu_op rs rt
-      | DIV (rs, rt) -> exec_hilo div_op rs rt
-      | DIVU (rs, rt) -> exec_hilo divu_op rs rt
-      | AND (rd, rs, rt) -> exec_rtype ( land ) no_ovf rd rs rt
-      | ADDI (rt, rs, imm) -> exec_itype ( + ) ovf_add rt rs (ext16 imm)
-      | ADDIU (rt, rs, imm) -> exec_itype ( + ) no_ovf rt rs (ext16 imm)
-      | ANDI (rt, rs, imm) -> exec_itype ( land ) no_ovf rt rs (mask16 imm)
-      | OR (rd, rs, rt) -> exec_rtype ( lor ) no_ovf rd rs rt
-      | ORI (rt, rs, imm) -> exec_itype ( lor ) no_ovf rt rs (mask16 imm)
-      | NOR (rd, rs, rt) ->
-          exec_rtype (fun a b -> lnot (a lor b)) no_ovf rd rs rt
-      | XOR (rd, rs, rt) -> exec_rtype ( lxor ) no_ovf rd rs rt
-      | XORI (rt, rs, imm) -> exec_itype ( lxor ) no_ovf rt rs (mask16 imm)
-      | SLT (rd, rs, rt) ->
-          let res = if ext32 (get_reg rs) < ext32 (get_reg rt) then 1 else 0 in
-          set_reg rd res
-      | SLTU (rd, rs, rt) ->
-          let res =
-            if (get_reg rs land 0xFFFFFFFF) < (get_reg rt land 0xFFFFFFFF) then
-              1
-            else 0
-          in
-          set_reg rd res
-      | SLTI (rt, rs, imm) ->
-          let res = if ext32 (get_reg rs) < ext16 imm then 1 else 0 in
-          set_reg rt res
-      | SLTIU (rt, rs, imm) ->
-          let res =
-            if (get_reg rs land 0xFFFFFFFF) < (ext16 imm land 0xFFFFFFFF) then
-              1
-            else 0
-          in
-          set_reg rt res
-      | SLL (rd, rt, shamt) -> set_reg rd ((get_reg rt lsl shamt) land 0xFFFFFFFF)
-      | LUI (rt, imm) -> set_reg rt ((imm land 0xFFFF) lsl 16)
-      | LB (rt, rs, imm) ->
-          set_reg rt (read_byte cpu.bus (get_reg rs + ext16 imm))
-      | LBU (rt, rs, imm) ->
-          set_reg rt (read_byte_u cpu.bus (get_reg rs + ext16 imm))
-      | LH (rt, rs, imm) ->
-          set_reg rt (read_halfword cpu.bus (get_reg rs + ext16 imm))
-      | LHU (rt, rs, imm) ->
-          set_reg rt (read_halfword_u cpu.bus (get_reg rs + ext16 imm))
-      | LW (rt, rs, imm) ->
-          set_reg rt (read_word cpu.bus (get_reg rs + ext16 imm))
-      | SB (rt, rs, imm) ->
-          write_byte cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
-      | SH (rt, rs, imm) ->
-          write_halfword cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
-      | SW (rt, rs, imm) ->
-          write_word cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
-      | BREAK -> raise_exception Break
-      | SYSCALL -> raise_exception Syscall
-      | MFC0 (rt, rd) -> set_reg rt (c0_of_reg rd)
-      | MTC0 (rt, rd) -> set_c0_reg rd (get_reg rt)
-      | MFHI rd -> set_reg rd cpu.regs.hi
-      | MFLO rd -> set_reg rd cpu.regs.lo
-      | MTHI rs -> cpu.regs.hi <- get_reg rs
-      | MTLO rs -> cpu.regs.lo <- get_reg rs
-      | J target ->
-          let target_addr = cpu.pc land 0xF0000000 lor (target lsl 2) in
+  try
+    (match instr with
+    | ADD (rd, rs, rt) -> exec_rtype ( + ) ovf_add rd rs rt
+    | SUB (rd, rs, rt) -> exec_rtype ( - ) ovf_sub rd rs rt
+    | ADDU (rd, rs, rt) -> exec_rtype ( + ) no_ovf rd rs rt
+    | SUBU (rd, rs, rt) -> exec_rtype ( - ) no_ovf rd rs rt
+    | MULT (rs, rt) -> exec_hilo mult_op rs rt
+    | MULTU (rs, rt) -> exec_hilo multu_op rs rt
+    | DIV (rs, rt) -> exec_hilo div_op rs rt
+    | DIVU (rs, rt) -> exec_hilo divu_op rs rt
+    | AND (rd, rs, rt) -> exec_rtype ( land ) no_ovf rd rs rt
+    | ADDI (rt, rs, imm) -> exec_itype ( + ) ovf_add rt rs (ext16 imm)
+    | ADDIU (rt, rs, imm) -> exec_itype ( + ) no_ovf rt rs (ext16 imm)
+    | ANDI (rt, rs, imm) -> exec_itype ( land ) no_ovf rt rs (mask16 imm)
+    | OR (rd, rs, rt) -> exec_rtype ( lor ) no_ovf rd rs rt
+    | ORI (rt, rs, imm) -> exec_itype ( lor ) no_ovf rt rs (mask16 imm)
+    | NOR (rd, rs, rt) -> exec_rtype (fun a b -> lnot (a lor b)) no_ovf rd rs rt
+    | XOR (rd, rs, rt) -> exec_rtype ( lxor ) no_ovf rd rs rt
+    | XORI (rt, rs, imm) -> exec_itype ( lxor ) no_ovf rt rs (mask16 imm)
+    | SLT (rd, rs, rt) ->
+        let res = if ext32 (get_reg rs) < ext32 (get_reg rt) then 1 else 0 in
+        set_reg rd res
+    | SLTU (rd, rs, rt) ->
+        let res =
+          if get_reg rs land 0xFFFFFFFF < get_reg rt land 0xFFFFFFFF then 1
+          else 0
+        in
+        set_reg rd res
+    | SLTI (rt, rs, imm) ->
+        let res = if ext32 (get_reg rs) < ext16 imm then 1 else 0 in
+        set_reg rt res
+    | SLTIU (rt, rs, imm) ->
+        let res =
+          if get_reg rs land 0xFFFFFFFF < ext16 imm land 0xFFFFFFFF then 1
+          else 0
+        in
+        set_reg rt res
+    | SLL (rd, rt, shamt) -> set_reg rd ((get_reg rt lsl shamt) land 0xFFFFFFFF)
+    | LUI (rt, imm) -> set_reg rt ((imm land 0xFFFF) lsl 16)
+    | LB (rt, rs, imm) ->
+        set_reg rt (read_byte cpu.bus (get_reg rs + ext16 imm))
+    | LBU (rt, rs, imm) ->
+        set_reg rt (read_byte_u cpu.bus (get_reg rs + ext16 imm))
+    | LH (rt, rs, imm) ->
+        set_reg rt (read_halfword cpu.bus (get_reg rs + ext16 imm))
+    | LHU (rt, rs, imm) ->
+        set_reg rt (read_halfword_u cpu.bus (get_reg rs + ext16 imm))
+    | LW (rt, rs, imm) ->
+        set_reg rt (read_word cpu.bus (get_reg rs + ext16 imm))
+    | SB (rt, rs, imm) ->
+        write_byte cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
+    | SH (rt, rs, imm) ->
+        write_halfword cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
+    | SW (rt, rs, imm) ->
+        write_word cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
+    | BREAK -> raise_exception Break
+    | SYSCALL -> raise_exception Syscall
+    | MFC0 (rt, rd) -> set_reg rt (c0_of_reg rd)
+    | MTC0 (rt, rd) -> set_c0_reg rd (get_reg rt)
+    | MFHI rd -> set_reg rd cpu.regs.hi
+    | MFLO rd -> set_reg rd cpu.regs.lo
+    | MTHI rs -> cpu.regs.hi <- get_reg rs
+    | MTLO rs -> cpu.regs.lo <- get_reg rs
+    | J target ->
+        let target_addr = cpu.pc land 0xF0000000 lor (target lsl 2) in
+        cpu.regs.delayed_branch <- Some target_addr
+    | JAL target ->
+        set_reg 31 (cpu.pc + 8);
+        let target_addr = cpu.pc land 0xF0000000 lor (target lsl 2) in
+        cpu.regs.delayed_branch <- Some target_addr
+    | JALR (rd, rs) ->
+        set_reg rd (cpu.pc + 8);
+        cpu.regs.delayed_branch <- Some (get_reg rs)
+    | JR rs -> cpu.regs.delayed_branch <- Some (get_reg rs)
+    | RFE ->
+        let mode_bits = cpu.cp0.sr land 0x3F in
+        let sr_cleared = cpu.cp0.sr land lnot 0x3F in
+        cpu.cp0.sr <- sr_cleared lor ((mode_bits lsr 2) land 0x3F)
+    | BLTZ (rs, offset) ->
+        if ext32 (get_reg rs) < 0 then
+          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
           cpu.regs.delayed_branch <- Some target_addr
-      | JAL target ->
-          set_reg 31 (cpu.pc + 8);
-          let target_addr = cpu.pc land 0xF0000000 lor (target lsl 2) in
+    | BGEZ (rs, offset) ->
+        if ext32 (get_reg rs) >= 0 then
+          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
           cpu.regs.delayed_branch <- Some target_addr
-      | JALR (rd, rs) ->
-          set_reg rd (cpu.pc + 8);
-          cpu.regs.delayed_branch <- Some (get_reg rs)
-      | JR rs -> cpu.regs.delayed_branch <- Some (get_reg rs)
-      | RFE ->
-          let mode_bits = cpu.cp0.sr land 0x3F in
-          let sr_cleared = cpu.cp0.sr land lnot 0x3F in
-          cpu.cp0.sr <- sr_cleared lor ((mode_bits lsr 2) land 0x3F)
-      | BLTZ (rs, offset) ->
-          if ext32 (get_reg rs) < 0 then
-            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-            cpu.regs.delayed_branch <- Some target_addr
-      | BGEZ (rs, offset) ->
-          if ext32 (get_reg rs) >= 0 then
-            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-            cpu.regs.delayed_branch <- Some target_addr
-      | BLTZAL (rs, offset) ->
-          set_reg 31 (cpu.pc + 8);
-          if ext32 (get_reg rs) < 0 then
-            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-            cpu.regs.delayed_branch <- Some target_addr
-      | BGEZAL (rs, offset) ->
-          set_reg 31 (cpu.pc + 8);
-          if ext32 (get_reg rs) >= 0 then
-            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-            cpu.regs.delayed_branch <- Some target_addr
-      | BEQ (rs, rt, offset) ->
-          if get_reg rs = get_reg rt then
-            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-            cpu.regs.delayed_branch <- Some target_addr
-      | BNE (rs, rt, offset) ->
-          if get_reg rs <> get_reg rt then
-            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-            cpu.regs.delayed_branch <- Some target_addr);
-     cpu.pc <- next_pc
-   with
-   | CpuException _ -> ()
-   (* Any other unexpected error (Invalid_argument, etc.) is fatal and
-      propagates so we do not silently skip broken instructions. *))
-
+    | BLTZAL (rs, offset) ->
+        set_reg 31 (cpu.pc + 8);
+        if ext32 (get_reg rs) < 0 then
+          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+          cpu.regs.delayed_branch <- Some target_addr
+    | BGEZAL (rs, offset) ->
+        set_reg 31 (cpu.pc + 8);
+        if ext32 (get_reg rs) >= 0 then
+          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+          cpu.regs.delayed_branch <- Some target_addr
+    | BEQ (rs, rt, offset) ->
+        if get_reg rs = get_reg rt then
+          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+          cpu.regs.delayed_branch <- Some target_addr
+    | BNE (rs, rt, offset) ->
+        if get_reg rs <> get_reg rt then
+          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+          cpu.regs.delayed_branch <- Some target_addr);
+    cpu.pc <- next_pc
+  with CpuException _ -> ()
+(* Any other unexpected error (Invalid_argument, etc.) is fatal and
+      propagates so we do not silently skip broken instructions. *)
 
 exception UnknownOpcode of int
 exception UnknownFunction of int
+
 (* register exception printer *)
 let string_of_bin ~width n =
   let rec aux n acc =
@@ -529,17 +525,15 @@ let string_of_bin ~width n =
   in
   let raw = if n = 0 then "0" else aux n "" in
   let len = String.length raw in
-  if len >= width then raw
-  else String.make (width - len) '0' ^ raw
+  if len >= width then raw else String.make (width - len) '0' ^ raw
 
 let () =
   Printexc.register_printer (function
-    | UnknownOpcode code ->
-        Some (Printf.sprintf "Unknown Opcode: 0x%08X" code)
+    | UnknownOpcode code -> Some (Printf.sprintf "Unknown Opcode: 0x%08X" code)
     | UnknownFunction funct ->
-        Some (Printf.sprintf "Unknown Function: %s" (string_of_bin ~width:6 funct))
-    | _ -> None 
-  )
+        Some
+          (Printf.sprintf "Unknown Function: %s" (string_of_bin ~width:6 funct))
+    | _ -> None)
 
 (** given a word - 32bit - decode the opcode*)
 let parse_opcode (instr : int) : instruction =
