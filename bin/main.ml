@@ -1,1 +1,3 @@
-let () = print_endline "Hello, World!"
+open Camlstation.Machine
+
+let _ = run_machine ()
