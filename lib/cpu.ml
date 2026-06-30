@@ -104,7 +104,10 @@ type instruction =
   | JALR of two
   | JR of one
   | RFE
-  | BQEZ of two
+  | BLTZ of two
+  | BGEZ of two
+  | BLTZAL of two
+  | BGEZAL of two
   | BEQ of three
   | BNE of three
 
@@ -483,8 +486,22 @@ let execute (cpu : cpu) (instr : instruction) : unit =
           let mode_bits = cpu.cp0.sr land 0x3F in
           let sr_cleared = cpu.cp0.sr land lnot 0x3F in
           cpu.cp0.sr <- sr_cleared lor ((mode_bits lsr 2) land 0x3F)
-      | BQEZ (rs, offset) ->
-          if get_reg rs = 0 then
+      | BLTZ (rs, offset) ->
+          if ext32 (get_reg rs) < 0 then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BGEZ (rs, offset) ->
+          if ext32 (get_reg rs) >= 0 then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BLTZAL (rs, offset) ->
+          set_reg 31 (cpu.pc + 8);
+          if ext32 (get_reg rs) < 0 then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BGEZAL (rs, offset) ->
+          set_reg 31 (cpu.pc + 8);
+          if ext32 (get_reg rs) >= 0 then
             let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
             cpu.regs.delayed_branch <- Some target_addr
       | BEQ (rs, rt, offset) ->
@@ -582,7 +599,11 @@ let parse_opcode (instr : int) : instruction =
   | 0b000011 -> JAL target
   | 0b000100 -> BEQ (rs, rt, imm)
   | 0b000101 -> BNE (rs, rt, imm)
-  | 0b000001 -> BQEZ (rs, imm)
+  | 0b000001 -> (
+      match rt with
+      | 0x10 -> BLTZAL (rs, imm)
+      | 0x11 -> BGEZAL (rs, imm)
+      | _ -> if rt land 1 = 0 then BLTZ (rs, imm) else BGEZ (rs, imm))
   | 0b010000 -> (
       match rs with
       | 0b00000 -> MFC0 (rt, rd)
