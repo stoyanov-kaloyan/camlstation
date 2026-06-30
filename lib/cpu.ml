@@ -105,7 +105,7 @@ type instruction =
   | DIV of two
   | DIVU of two
   | MFC0 of two
-  | MFHI of int 
+  | MFHI of int
   | MFLO of int
   | MTC0 of two
   | MTHI of int
@@ -414,10 +414,10 @@ let mult_op a b =
 let divu_op a b =
   let a_val = a land 0xFFFFFFFF in
   let b_val = b land 0xFFFFFFFF in
-  if b_val = 0 then (a_val, -1)
-  else (a_val mod b_val, a_val / b_val)
+  if b_val = 0 then (a_val, -1) else (a_val mod b_val, a_val / b_val)
 
-let div_op = fun a b -> 
+let div_op =
+ fun a b ->
   (* from jsgroth
     this is how DIV and DIVU behave when the divisor is 0:
 
@@ -427,8 +427,7 @@ let div_op = fun a b ->
   *)
   let a_val = ext32 a in
   let b_val = ext32 b in
-  if b_val = 0 then
-    if a_val >= 0 then (a_val, -1) else (a_val, 1)
+  if b_val = 0 then if a_val >= 0 then (a_val, -1) else (a_val, 1)
   else if a_val = -0x80000000 && b_val = -1 then (0, -0x80000000)
   else (a_val mod b_val, a_val / b_val)
 
@@ -595,6 +594,37 @@ let execute (cpu : cpu) (instr : instruction) : unit =
       let pending = cpu.i_stat land cpu.i_mask land 0x7FF in
       if pending <> 0 && cpu.cp0.sr land 1 <> 0 then raise_exception Interrupt
   in
+  let load_word_helper rt rs imm op is_right =
+    let addr = get_reg rs + ext16 imm in
+    let word_addr = addr land lnot 3 in
+    let word = read_word cpu word_addr in
+    let shift = if is_right then addr land 3 * 8 else (3 - (addr land 3)) * 8 in
+    let mask = op 0xFFFFFFFF shift land 0xFFFFFFFF in
+    let new_value = op word shift land mask in
+    let old_value = get_reg rt land lnot mask in
+    set_reg rt (new_value lor old_value)
+  in
+
+  let store_word_helper rt rs imm op is_right =
+    let addr = get_reg rs + ext16 imm in
+    let word_addr = addr land lnot 3 in
+    let mem_word = read_word cpu word_addr in
+    let reg_val = get_reg rt in
+    let shift_right =
+      if is_right then addr land 3 * 8 else (3 - (addr land 3)) * 8
+    in
+    let new_bits_mask =
+      if is_right then 0xFFFFFFFF lsl shift_right
+      else 0xFFFFFFFF lsr shift_right
+    in
+    let new_mem_chunk =
+      if is_right then (reg_val lsl shift_right) land new_bits_mask
+      else (reg_val lsr shift_right) land new_bits_mask
+    in
+    let old_mem_chunk = mem_word land lnot new_bits_mask in
+    write_word cpu word_addr (new_mem_chunk lor old_mem_chunk)
+  in
+
   try
     check_interrupts ();
     (match instr with
@@ -663,9 +693,8 @@ let execute (cpu : cpu) (instr : instruction) : unit =
         let addr = get_reg rs + ext16 imm in
         if addr land 3 <> 0 then raise_exception (AddressErrorLoad addr)
         else set_reg rt (read_word cpu addr)
-    | LWL (rt, rs, imm) | LWR (rt, rs, imm) ->
-        let addr = get_reg rs + ext16 imm in
-        set_reg rt (read_word cpu (addr land lnot 3))
+    | LWL (rt, rs, imm) -> load_word_helper rt rs imm ( lsl ) false
+    | LWR (rt, rs, imm) -> load_word_helper rt rs imm ( lsr ) true
     | SB (rt, rs, imm) -> write_byte cpu (get_reg rs + ext16 imm) (get_reg rt)
     | SH (rt, rs, imm) ->
         let addr = get_reg rs + ext16 imm in
@@ -675,9 +704,8 @@ let execute (cpu : cpu) (instr : instruction) : unit =
         let addr = get_reg rs + ext16 imm in
         if addr land 3 <> 0 then raise_exception (AddressErrorStore addr)
         else write_word cpu addr (get_reg rt)
-    | SWL (rt, rs, imm) | SWR (rt, rs, imm) ->
-        let addr = get_reg rs + ext16 imm in
-        write_word cpu (addr land lnot 3) (get_reg rt)
+    | SWL (rt, rs, imm) -> store_word_helper rt rs imm ( lsl ) false
+    | SWR (rt, rs, imm) -> store_word_helper rt rs imm ( lsr ) true
     | BREAK -> raise_exception Break
     | SYSCALL -> raise_exception Syscall
     | MFC0 (rt, rd) -> set_reg rt (c0_of_reg rd)
