@@ -411,15 +411,26 @@ let mult_op a b =
     (hi_neg, lo_neg)
   else (hi, lo)
 
-let generic_div is_signed a b =
-  let a_val = if is_signed then ext32 a else a land 0xFFFFFFFF in
-  let b_val = if is_signed then ext32 b else b land 0xFFFFFFFF in
-  if b_val = 0 then (0, 0)
-  else if is_signed && a_val = -0x80000000 && b_val = -1 then (0, -0x80000000)
+let divu_op a b =
+  let a_val = a land 0xFFFFFFFF in
+  let b_val = b land 0xFFFFFFFF in
+  if b_val = 0 then (a_val, -1)
   else (a_val mod b_val, a_val / b_val)
 
-let div_op = generic_div true
-let divu_op = generic_div false
+let div_op = fun a b -> 
+  (* from jsgroth
+    this is how DIV and DIVU behave when the divisor is 0:
+
+    Remainder is always set to the dividend
+    DIV with a non-negative dividend and DIVU set the quotient to $FFFFFFFF (-1)
+    DIV with a negative dividend sets the quotient to $00000001 (+1)
+  *)
+  let a_val = ext32 a in
+  let b_val = ext32 b in
+  if b_val = 0 then
+    if a_val >= 0 then (a_val, -1) else (a_val, 1)
+  else if a_val = -0x80000000 && b_val = -1 then (0, -0x80000000)
+  else (a_val mod b_val, a_val / b_val)
 
 let handle_bios_call (cpu : cpu) =
   if
