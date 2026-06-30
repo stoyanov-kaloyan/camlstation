@@ -631,9 +631,11 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     write_word cpu word_addr (new_mem_chunk lor old_mem_chunk)
   in
 
-  let sw_sh_helper rt rs imm land_val write_op =
+  let sw_sh_helper rt rs imm land_val write_op is_store =
     let addr = get_reg rs + ext16 imm in
-    if addr land land_val <> 0 then raise_exception (AddressErrorStore addr)
+    if addr land land_val <> 0 then
+      if is_store then raise_exception (AddressErrorStore addr)
+      else raise_exception (AddressErrorLoad addr)
     else write_op cpu addr (get_reg rt)
   in
 
@@ -708,8 +710,8 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     | LWL (rt, rs, imm) -> load_word_helper rt rs imm ( lsl ) false
     | LWR (rt, rs, imm) -> load_word_helper rt rs imm ( lsr ) true
     | SB (rt, rs, imm) -> write_byte cpu (get_reg rs + ext16 imm) (get_reg rt)
-    | SH (rt, rs, imm) -> sw_sh_helper rt rs imm 1 write_halfword
-    | SW (rt, rs, imm) -> sw_sh_helper rt rs imm 3 write_word
+    | SH (rt, rs, imm) -> sw_sh_helper rt rs imm 1 write_halfword true
+    | SW (rt, rs, imm) -> sw_sh_helper rt rs imm 3 write_word true
     | SWL (rt, rs, imm) -> store_word_helper rt rs imm ( lsl ) false
     | SWR (rt, rs, imm) -> store_word_helper rt rs imm ( lsr ) true
     | BREAK -> raise_exception Break
@@ -728,13 +730,23 @@ let execute (cpu : cpu) (instr : instruction) : unit =
         let target_addr = cpu.pc land 0xF0000000 lor (target lsl 2) in
         cpu.regs.delayed_branch <- Some (target_addr, cpu.pc)
     | JALR (rd, rs) ->
+        let target_addr = get_reg rs in
         set_reg rd (cpu.pc + 8);
-        cpu.regs.delayed_branch <- Some (get_reg rs, cpu.pc)
-    | JR rs -> cpu.regs.delayed_branch <- Some (get_reg rs, cpu.pc)
+        if target_addr land 3 <> 0 then
+          raise_exception (AddressErrorLoad target_addr)
+        else cpu.regs.delayed_branch <- Some (target_addr, cpu.pc)
+    | JR rs ->
+        let target_addr = get_reg rs in
+        if target_addr land 3 <> 0 then
+          raise_exception (AddressErrorLoad target_addr)
+        else cpu.regs.delayed_branch <- Some (target_addr, cpu.pc)
     | RFE ->
         let mode_bits = cpu.cp0.sr land 0x3F in
         let sr_cleared = cpu.cp0.sr land lnot 0x3F in
-        cpu.cp0.sr <- sr_cleared lor ((mode_bits lsr 2) land 0x3F)
+        let new_mode_bits =
+          mode_bits land 0x30 lor ((mode_bits lsr 2) land 0x0F)
+        in
+        cpu.cp0.sr <- sr_cleared lor new_mode_bits
     | BLTZ (rs, offset) ->
         if ext32 (get_reg rs) < 0 then
           let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
