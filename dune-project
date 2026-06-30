@@ -1,6 +1,7 @@
 (lang dune 3.23)
 
 (name camlstation)
+(map_workspace_root false)
 
 (generate_opam_files true)
 

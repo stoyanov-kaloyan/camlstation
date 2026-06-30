@@ -5,7 +5,8 @@
       "name": "OCaml (earlybird)",
       "type": "ocaml.earlybird",
       "request": "launch",
-      "program": "${workspaceFolder}/_build/default/bin/main.exe",
+      "program": "${workspaceFolder}/_build/default/bin/main.bc",
+      "cwd": "${workspaceFolder}",
       "stopOnEntry": false
     }
   ]
