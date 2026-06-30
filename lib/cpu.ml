@@ -13,6 +13,7 @@ type cp0 = {
   mutable context : int;
   mutable pagemask : int;
   mutable wired : int;
+  mutable reserved7 : int;
   mutable badvaddr : int;
   mutable count : int;
   mutable entryhi : int;
@@ -66,10 +67,6 @@ type instruction =
   | ADDIU of three
   | ADDU of three
   | SUBU of three
-  | SLT of three
-  | SLTU of three
-  | SLTI of three
-  | SLTIU of three
   | AND of three
   | ANDI of three
   | OR of three
@@ -78,15 +75,30 @@ type instruction =
   | XOR of three
   | XORI of three
   | SLL of three
+  | SRL of three
+  | SRA of three
+  | SLLV of three
+  | SRLV of three
+  | SRAV of three
+  | SLT of three
+  | SLTU of three
+  | SLTI of three
+  | SLTIU of three
+  | MOVZ of three
+  | MOVN of three
   | LUI of two
   | LB of three
   | LBU of three
   | LH of three
   | LHU of three
   | LW of three
+  | LWL of three
+  | LWR of three
   | SB of three
   | SH of three
   | SW of three
+  | SWL of three
+  | SWR of three
   | BREAK
   | SYSCALL
   | MULT of two
@@ -110,19 +122,29 @@ type instruction =
   | BGEZAL of two
   | BEQ of three
   | BNE of three
+  | BGTZ of two
+  | BLEZ of two
 
 type cpu = {
-  mutable bus : int array;
+  mutable ram : int array;
+  mutable bios : int array;
+  mutable scratchpad : int array;
+  mutable cache : int array;
   mutable pc : int;
   mutable regs : registers;
   mutable cp0 : cp0;
+  mutable i_stat : int;
+  mutable i_mask : int;
+  mutable cycle_count : int;
 }
 
 let cpu_of_bios bios =
-  let bus = bios in
   {
-    bus;
-    pc = 0x0000000;
+    ram = Array.make (2 * 1024 * 1024) 0;
+    bios;
+    scratchpad = Array.make 1024 0;
+    cache = Array.make (4 * 1024) 0;
+    pc = 0xBFC00000;
     regs = { gp = Array.make 32 0; hi = 0; lo = 0; delayed_branch = None };
     cp0 =
       {
@@ -133,6 +155,7 @@ let cpu_of_bios bios =
         context = 0;
         pagemask = 0;
         wired = 0;
+        reserved7 = 0;
         badvaddr = 0;
         count = 0;
         entryhi = 0;
@@ -143,57 +166,192 @@ let cpu_of_bios bios =
         prid = 0;
         config = 0;
       };
+    i_stat = 0;
+    i_mask = 0;
+    cycle_count = 0;
   }
 
-let bus_size = 4 * 1024 * 1024
-let bus_addr addr = addr land (bus_size - 1)
+(* Translate a virtual address to a physical address using the PS1's
+   fixed memory map. KSEG0/KSEG1/KSEG2 are mapped by clearing the top 3 bits. *)
+let phys_addr addr =
+  if addr land 0x80000000 <> 0 then addr land 0x1FFFFFFF else addr
 
-let read_word (bus : int array) (addr : int) : int =
-  let a0 = bus_addr addr in
-  let a1 = bus_addr (addr + 1) in
-  let a2 = bus_addr (addr + 2) in
-  let a3 = bus_addr (addr + 3) in
-  ((bus.(a3) land 0xFF) lsl 24)
-  lor ((bus.(a2) land 0xFF) lsl 16)
-  lor ((bus.(a1) land 0xFF) lsl 8)
-  lor (bus.(a0) land 0xFF)
+let read_word_array (arr : int array) (addr : int) : int =
+  ((arr.(addr + 3) land 0xFF) lsl 24)
+  lor ((arr.(addr + 2) land 0xFF) lsl 16)
+  lor ((arr.(addr + 1) land 0xFF) lsl 8)
+  lor (arr.(addr) land 0xFF)
 
-let write_word (bus : int array) (addr : int) (value : int) : unit =
-  let a0 = bus_addr addr in
-  let a1 = bus_addr (addr + 1) in
-  let a2 = bus_addr (addr + 2) in
-  let a3 = bus_addr (addr + 3) in
-  bus.(a0) <- value land 0xFF;
-  bus.(a1) <- (value lsr 8) land 0xFF;
-  bus.(a2) <- (value lsr 16) land 0xFF;
-  bus.(a3) <- (value lsr 24) land 0xFF
+let write_word_array (arr : int array) (addr : int) (value : int) : unit =
+  arr.(addr) <- value land 0xFF;
+  arr.(addr + 1) <- (value lsr 8) land 0xFF;
+  arr.(addr + 2) <- (value lsr 16) land 0xFF;
+  arr.(addr + 3) <- (value lsr 24) land 0xFF
 
-let read_byte (bus : int array) (addr : int) : int =
-  let b = bus.(bus_addr addr) land 0xFF in
+let read_byte_array (arr : int array) (addr : int) : int =
+  let b = arr.(addr) land 0xFF in
   if b land 0x80 <> 0 then b lor lnot 0xFF else b
 
-let read_byte_u (bus : int array) (addr : int) : int =
-  bus.(bus_addr addr) land 0xFF
+let read_byte_u_array (arr : int array) (addr : int) : int =
+  arr.(addr) land 0xFF
 
-let read_halfword (bus : int array) (addr : int) : int =
-  let a0 = bus_addr addr in
-  let a1 = bus_addr (addr + 1) in
-  let h = ((bus.(a1) land 0xFF) lsl 8) lor (bus.(a0) land 0xFF) in
+let read_halfword_array (arr : int array) (addr : int) : int =
+  let h = ((arr.(addr + 1) land 0xFF) lsl 8) lor (arr.(addr) land 0xFF) in
   if h land 0x8000 <> 0 then h lor lnot 0xFFFF else h
 
-let read_halfword_u (bus : int array) (addr : int) : int =
-  let a0 = bus_addr addr in
-  let a1 = bus_addr (addr + 1) in
-  ((bus.(a1) land 0xFF) lsl 8) lor (bus.(a0) land 0xFF)
+let read_halfword_u_array (arr : int array) (addr : int) : int =
+  ((arr.(addr + 1) land 0xFF) lsl 8) lor (arr.(addr) land 0xFF)
 
-let write_byte (bus : int array) (addr : int) (value : int) : unit =
-  bus.(bus_addr addr) <- value land 0xFF
+let write_byte_array (arr : int array) (addr : int) (value : int) : unit =
+  arr.(addr) <- value land 0xFF
 
-let write_halfword (bus : int array) (addr : int) (value : int) : unit =
-  let a0 = bus_addr addr in
-  let a1 = bus_addr (addr + 1) in
-  bus.(a0) <- value land 0xFF;
-  bus.(a1) <- (value lsr 8) land 0xFF
+let write_halfword_array (arr : int array) (addr : int) (value : int) : unit =
+  arr.(addr) <- value land 0xFF;
+  arr.(addr + 1) <- (value lsr 8) land 0xFF
+
+let cache_isolated cpu = cpu.cp0.sr land 0x10000 <> 0
+let cache_addr addr = addr land 0xFFF
+
+let read_word_cache cache addr =
+  let a = cache_addr addr in
+  ((cache.(a + 3) land 0xFF) lsl 24)
+  lor ((cache.(a + 2) land 0xFF) lsl 16)
+  lor ((cache.(a + 1) land 0xFF) lsl 8)
+  lor (cache.(a) land 0xFF)
+
+let write_word_cache cache addr value =
+  let a = cache_addr addr in
+  cache.(a) <- value land 0xFF;
+  cache.(a + 1) <- (value lsr 8) land 0xFF;
+  cache.(a + 2) <- (value lsr 16) land 0xFF;
+  cache.(a + 3) <- (value lsr 24) land 0xFF
+
+let read_byte_cache cache addr =
+  let b = cache.(cache_addr addr) land 0xFF in
+  if b land 0x80 <> 0 then b lor lnot 0xFF else b
+
+let read_byte_u_cache cache addr = cache.(cache_addr addr) land 0xFF
+
+let read_halfword_cache cache addr =
+  let a = cache_addr addr in
+  let h = ((cache.(a + 1) land 0xFF) lsl 8) lor (cache.(a) land 0xFF) in
+  if h land 0x8000 <> 0 then h lor lnot 0xFFFF else h
+
+let read_halfword_u_cache cache addr =
+  let a = cache_addr addr in
+  ((cache.(a + 1) land 0xFF) lsl 8) lor (cache.(a) land 0xFF)
+
+let write_byte_cache cache addr value =
+  cache.(cache_addr addr) <- value land 0xFF
+
+let write_halfword_cache cache addr value =
+  let a = cache_addr addr in
+  cache.(a) <- value land 0xFF;
+  cache.(a + 1) <- (value lsr 8) land 0xFF
+
+let fetch_word (cpu : cpu) (addr : int) : int =
+  let p = phys_addr addr in
+  if p >= 0x1FC00000 && p < 0x1FC80000 then
+    read_word_array cpu.bios (p - 0x1FC00000)
+  else if p >= 0x1F800000 && p < 0x1F800400 then
+    read_word_array cpu.scratchpad (p - 0x1F800000)
+  else if p >= 0 && p < 0x00200000 then read_word_array cpu.ram p
+  else 0
+
+let gpu_status () = 0x1C000000
+
+let read_word (cpu : cpu) (addr : int) : int =
+  if cache_isolated cpu then read_word_cache cpu.cache addr
+  else
+    let p = phys_addr addr in
+    if p >= 0x1FC00000 && p < 0x1FC80000 then
+      read_word_array cpu.bios (p - 0x1FC00000)
+    else if p >= 0x1F800000 && p < 0x1F800400 then
+      read_word_array cpu.scratchpad (p - 0x1F800000)
+    else if p >= 0 && p < 0x00200000 then read_word_array cpu.ram p
+    else if p = 0x1F801810 || p = 0x1F801814 then gpu_status ()
+    else if p = 0x1F801070 then cpu.i_stat
+    else if p = 0x1F801074 then cpu.i_mask
+    else 0
+
+let write_word (cpu : cpu) (addr : int) (value : int) : unit =
+  if cache_isolated cpu then write_word_cache cpu.cache addr value
+  else
+    let p = phys_addr addr in
+    if p >= 0x1FC00000 && p < 0x1FC80000 then
+      write_word_array cpu.bios (p - 0x1FC00000) value
+    else if p >= 0x1F800000 && p < 0x1F800400 then
+      write_word_array cpu.scratchpad (p - 0x1F800000) value
+    else if p >= 0 && p < 0x00200000 then write_word_array cpu.ram p value
+    else if p = 0x1F801070 then cpu.i_stat <- cpu.i_stat land lnot value
+    else if p = 0x1F801074 then cpu.i_mask <- value land 0x7FF
+    else ()
+
+let read_byte (cpu : cpu) (addr : int) : int =
+  if cache_isolated cpu then read_byte_cache cpu.cache addr
+  else
+    let p = phys_addr addr in
+    if p >= 0x1FC00000 && p < 0x1FC80000 then
+      read_byte_array cpu.bios (p - 0x1FC00000)
+    else if p >= 0x1F800000 && p < 0x1F800400 then
+      read_byte_array cpu.scratchpad (p - 0x1F800000)
+    else if p >= 0 && p < 0x00200000 then read_byte_array cpu.ram p
+    else 0
+
+let read_byte_u (cpu : cpu) (addr : int) : int =
+  if cache_isolated cpu then read_byte_u_cache cpu.cache addr
+  else
+    let p = phys_addr addr in
+    if p >= 0x1FC00000 && p < 0x1FC80000 then
+      read_byte_u_array cpu.bios (p - 0x1FC00000)
+    else if p >= 0x1F800000 && p < 0x1F800400 then
+      read_byte_u_array cpu.scratchpad (p - 0x1F800000)
+    else if p >= 0 && p < 0x00200000 then read_byte_u_array cpu.ram p
+    else 0
+
+let read_halfword (cpu : cpu) (addr : int) : int =
+  if cache_isolated cpu then read_halfword_cache cpu.cache addr
+  else
+    let p = phys_addr addr in
+    if p >= 0x1FC00000 && p < 0x1FC80000 then
+      read_halfword_array cpu.bios (p - 0x1FC00000)
+    else if p >= 0x1F800000 && p < 0x1F800400 then
+      read_halfword_array cpu.scratchpad (p - 0x1F800000)
+    else if p >= 0 && p < 0x00200000 then read_halfword_array cpu.ram p
+    else 0
+
+let read_halfword_u (cpu : cpu) (addr : int) : int =
+  if cache_isolated cpu then read_halfword_u_cache cpu.cache addr
+  else
+    let p = phys_addr addr in
+    if p >= 0x1FC00000 && p < 0x1FC80000 then
+      read_halfword_u_array cpu.bios (p - 0x1FC00000)
+    else if p >= 0x1F800000 && p < 0x1F800400 then
+      read_halfword_u_array cpu.scratchpad (p - 0x1F800000)
+    else if p >= 0 && p < 0x00200000 then read_halfword_u_array cpu.ram p
+    else 0
+
+let write_byte (cpu : cpu) (addr : int) (value : int) : unit =
+  if cache_isolated cpu then write_byte_cache cpu.cache addr value
+  else
+    let p = phys_addr addr in
+    if p >= 0x1FC00000 && p < 0x1FC80000 then
+      write_byte_array cpu.bios (p - 0x1FC00000) value
+    else if p >= 0x1F800000 && p < 0x1F800400 then
+      write_byte_array cpu.scratchpad (p - 0x1F800000) value
+    else if p >= 0 && p < 0x00200000 then write_byte_array cpu.ram p value
+    else ()
+
+let write_halfword (cpu : cpu) (addr : int) (value : int) : unit =
+  if cache_isolated cpu then write_halfword_cache cpu.cache addr value
+  else
+    let p = phys_addr addr in
+    if p >= 0x1FC00000 && p < 0x1FC80000 then
+      write_halfword_array cpu.bios (p - 0x1FC00000) value
+    else if p >= 0x1F800000 && p < 0x1F800400 then
+      write_halfword_array cpu.scratchpad (p - 0x1F800000) value
+    else if p >= 0 && p < 0x00200000 then write_halfword_array cpu.ram p value
+    else ()
 
 let mask16 imm = imm land 0xFFFF
 
@@ -263,13 +421,14 @@ let generic_div is_signed a b =
 let div_op = generic_div true
 let divu_op = generic_div false
 
-let check_for_tty_output (cpu : cpu) =
+let handle_bios_call (cpu : cpu) =
   if
     (cpu.pc = 0xA0 && cpu.regs.gp.(9) = 0x3C)
     || (cpu.pc = 0xB0 && cpu.regs.gp.(9) = 0x3D)
-  then
+  then (
     let char_code = cpu.regs.gp.(4) land 0xFF in
-    print_char (Char.chr char_code)
+    print_char (Char.chr char_code);
+    flush stdout)
 
 exception CpuException of cpu_exception
 
@@ -283,7 +442,7 @@ let execute (cpu : cpu) (instr : instruction) : unit =
 
   let set_reg (reg_num : int) (value : int) : unit =
     assert_valid_register reg_num;
-    if reg_num = 0 then () (* noop *) else cpu.regs.gp.(reg_num) <- value
+    if reg_num = 0 then () (* noop *) else cpu.regs.gp.(reg_num) <- to32 value
   in
 
   let c0_of_reg (reg_num : int) : int =
@@ -295,6 +454,7 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     | 4 -> cpu.cp0.context
     | 5 -> cpu.cp0.pagemask
     | 6 -> cpu.cp0.wired
+    | 7 -> cpu.cp0.reserved7
     | 8 -> cpu.cp0.badvaddr
     | 9 -> cpu.cp0.count
     | 10 -> cpu.cp0.entryhi
@@ -319,6 +479,7 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     | 4 -> cpu.cp0.context <- value
     | 5 -> cpu.cp0.pagemask <- value
     | 6 -> cpu.cp0.wired <- value
+    | 7 -> cpu.cp0.reserved7 <- value
     | 8 -> cpu.cp0.badvaddr <- value
     | 9 -> cpu.cp0.count <- value
     | 10 -> cpu.cp0.entryhi <- value
@@ -342,8 +503,13 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     let cause_exccode_mask = lnot 0x7C in
     cpu.cp0.cause <- cpu.cp0.cause land cause_exccode_mask lor (code lsl 2);
 
-    let code = code_of_exception exc in
-    print_endline ("Raising exception with code: " ^ string_of_int code);
+    (* Reflect pending hardware interrupts in Cause.IP2 (bit 10). *)
+    let pending = cpu.i_stat land cpu.i_mask in
+    let ip2_mask = 1 lsl 10 in
+    cpu.cp0.cause <-
+      (if pending <> 0 then cpu.cp0.cause lor ip2_mask
+       else cpu.cp0.cause land lnot ip2_mask);
+
     (match exc with
     | ProtectionFault addr | AddressErrorLoad addr | AddressErrorStore addr ->
         cpu.cp0.badvaddr <- addr
@@ -405,114 +571,146 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     | None -> (cpu.pc + 4, false)
   in
   ignore in_delay_slot;
-  try
-    (match instr with
-    | ADD (rd, rs, rt) -> exec_rtype ( + ) ovf_add rd rs rt
-    | SUB (rd, rs, rt) -> exec_rtype ( - ) ovf_sub rd rs rt
-    | ADDU (rd, rs, rt) -> exec_rtype ( + ) no_ovf rd rs rt
-    | SUBU (rd, rs, rt) -> exec_rtype ( - ) no_ovf rd rs rt
-    | MULT (rs, rt) -> exec_hilo mult_op rs rt
-    | MULTU (rs, rt) -> exec_hilo multu_op rs rt
-    | DIV (rs, rt) -> exec_hilo div_op rs rt
-    | DIVU (rs, rt) -> exec_hilo divu_op rs rt
-    | AND (rd, rs, rt) -> exec_rtype ( land ) no_ovf rd rs rt
-    | ADDI (rt, rs, imm) -> exec_itype ( + ) ovf_add rt rs (ext16 imm)
-    | ADDIU (rt, rs, imm) -> exec_itype ( + ) no_ovf rt rs (ext16 imm)
-    | ANDI (rt, rs, imm) -> exec_itype ( land ) no_ovf rt rs (mask16 imm)
-    | OR (rd, rs, rt) -> exec_rtype ( lor ) no_ovf rd rs rt
-    | ORI (rt, rs, imm) -> exec_itype ( lor ) no_ovf rt rs (mask16 imm)
-    | NOR (rd, rs, rt) -> exec_rtype (fun a b -> lnot (a lor b)) no_ovf rd rs rt
-    | XOR (rd, rs, rt) -> exec_rtype ( lxor ) no_ovf rd rs rt
-    | XORI (rt, rs, imm) -> exec_itype ( lxor ) no_ovf rt rs (mask16 imm)
-    | SLT (rd, rs, rt) ->
-        let res = if ext32 (get_reg rs) < ext32 (get_reg rt) then 1 else 0 in
-        set_reg rd res
-    | SLTU (rd, rs, rt) ->
-        let res =
-          if get_reg rs land 0xFFFFFFFF < get_reg rt land 0xFFFFFFFF then 1
-          else 0
-        in
-        set_reg rd res
-    | SLTI (rt, rs, imm) ->
-        let res = if ext32 (get_reg rs) < ext16 imm then 1 else 0 in
-        set_reg rt res
-    | SLTIU (rt, rs, imm) ->
-        let res =
-          if get_reg rs land 0xFFFFFFFF < ext16 imm land 0xFFFFFFFF then 1
-          else 0
-        in
-        set_reg rt res
-    | SLL (rd, rt, shamt) -> set_reg rd ((get_reg rt lsl shamt) land 0xFFFFFFFF)
-    | LUI (rt, imm) -> set_reg rt ((imm land 0xFFFF) lsl 16)
-    | LB (rt, rs, imm) ->
-        set_reg rt (read_byte cpu.bus (get_reg rs + ext16 imm))
-    | LBU (rt, rs, imm) ->
-        set_reg rt (read_byte_u cpu.bus (get_reg rs + ext16 imm))
-    | LH (rt, rs, imm) ->
-        set_reg rt (read_halfword cpu.bus (get_reg rs + ext16 imm))
-    | LHU (rt, rs, imm) ->
-        set_reg rt (read_halfword_u cpu.bus (get_reg rs + ext16 imm))
-    | LW (rt, rs, imm) ->
-        set_reg rt (read_word cpu.bus (get_reg rs + ext16 imm))
-    | SB (rt, rs, imm) ->
-        write_byte cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
-    | SH (rt, rs, imm) ->
-        write_halfword cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
-    | SW (rt, rs, imm) ->
-        write_word cpu.bus (get_reg rs + ext16 imm) (get_reg rt)
-    | BREAK -> raise_exception Break
-    | SYSCALL -> raise_exception Syscall
-    | MFC0 (rt, rd) -> set_reg rt (c0_of_reg rd)
-    | MTC0 (rt, rd) -> set_c0_reg rd (get_reg rt)
-    | MFHI rd -> set_reg rd cpu.regs.hi
-    | MFLO rd -> set_reg rd cpu.regs.lo
-    | MTHI rs -> cpu.regs.hi <- get_reg rs
-    | MTLO rs -> cpu.regs.lo <- get_reg rs
-    | J target ->
-        let target_addr = cpu.pc land 0xF0000000 lor (target lsl 2) in
-        cpu.regs.delayed_branch <- Some target_addr
-    | JAL target ->
-        set_reg 31 (cpu.pc + 8);
-        let target_addr = cpu.pc land 0xF0000000 lor (target lsl 2) in
-        cpu.regs.delayed_branch <- Some target_addr
-    | JALR (rd, rs) ->
-        set_reg rd (cpu.pc + 8);
-        cpu.regs.delayed_branch <- Some (get_reg rs)
-    | JR rs -> cpu.regs.delayed_branch <- Some (get_reg rs)
-    | RFE ->
-        let mode_bits = cpu.cp0.sr land 0x3F in
-        let sr_cleared = cpu.cp0.sr land lnot 0x3F in
-        cpu.cp0.sr <- sr_cleared lor ((mode_bits lsr 2) land 0x3F)
-    | BLTZ (rs, offset) ->
-        if ext32 (get_reg rs) < 0 then
-          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+  (* Check for pending hardware interrupts at instruction boundaries. *)
+  if cpu.regs.delayed_branch = None then (
+    let pending = cpu.i_stat land cpu.i_mask land 0x7FF in
+    if pending <> 0 && cpu.cp0.sr land 1 <> 0 && cpu.cp0.sr land 0x6 = 0 then
+      raise_exception Interrupt;
+    try
+      (match instr with
+      | ADD (rd, rs, rt) -> exec_rtype ( + ) ovf_add rd rs rt
+      | SUB (rd, rs, rt) -> exec_rtype ( - ) ovf_sub rd rs rt
+      | ADDU (rd, rs, rt) -> exec_rtype ( + ) no_ovf rd rs rt
+      | SUBU (rd, rs, rt) -> exec_rtype ( - ) no_ovf rd rs rt
+      | MULT (rs, rt) -> exec_hilo mult_op rs rt
+      | MULTU (rs, rt) -> exec_hilo multu_op rs rt
+      | DIV (rs, rt) -> exec_hilo div_op rs rt
+      | DIVU (rs, rt) -> exec_hilo divu_op rs rt
+      | AND (rd, rs, rt) -> exec_rtype ( land ) no_ovf rd rs rt
+      | ADDI (rt, rs, imm) -> exec_itype ( + ) ovf_add rt rs (ext16 imm)
+      | ADDIU (rt, rs, imm) -> exec_itype ( + ) no_ovf rt rs (ext16 imm)
+      | ANDI (rt, rs, imm) -> exec_itype ( land ) no_ovf rt rs (mask16 imm)
+      | OR (rd, rs, rt) -> exec_rtype ( lor ) no_ovf rd rs rt
+      | ORI (rt, rs, imm) -> exec_itype ( lor ) no_ovf rt rs (mask16 imm)
+      | NOR (rd, rs, rt) ->
+          exec_rtype (fun a b -> lnot (a lor b)) no_ovf rd rs rt
+      | XOR (rd, rs, rt) -> exec_rtype ( lxor ) no_ovf rd rs rt
+      | XORI (rt, rs, imm) -> exec_itype ( lxor ) no_ovf rt rs (mask16 imm)
+      | SLT (rd, rs, rt) ->
+          let res = if ext32 (get_reg rs) < ext32 (get_reg rt) then 1 else 0 in
+          set_reg rd res
+      | SLTU (rd, rs, rt) ->
+          let res =
+            if get_reg rs land 0xFFFFFFFF < get_reg rt land 0xFFFFFFFF then 1
+            else 0
+          in
+          set_reg rd res
+      | SLTI (rt, rs, imm) ->
+          let res = if ext32 (get_reg rs) < ext16 imm then 1 else 0 in
+          set_reg rt res
+      | SLTIU (rt, rs, imm) ->
+          let res =
+            if get_reg rs land 0xFFFFFFFF < ext16 imm land 0xFFFFFFFF then 1
+            else 0
+          in
+          set_reg rt res
+      | SLL (rd, rt, shamt) ->
+          set_reg rd ((get_reg rt lsl shamt) land 0xFFFFFFFF)
+      | SRL (rd, rt, shamt) ->
+          set_reg rd ((get_reg rt land 0xFFFFFFFF) lsr shamt)
+      | SRA (rd, rt, shamt) ->
+          let v = ext32 (get_reg rt) in
+          set_reg rd (v asr shamt)
+      | SLLV (rd, rt, rs) ->
+          let shamt = get_reg rs land 0x1F in
+          set_reg rd ((get_reg rt lsl shamt) land 0xFFFFFFFF)
+      | SRLV (rd, rt, rs) ->
+          let shamt = get_reg rs land 0x1F in
+          set_reg rd ((get_reg rt land 0xFFFFFFFF) lsr shamt)
+      | SRAV (rd, rt, rs) ->
+          let shamt = get_reg rs land 0x1F in
+          let v = ext32 (get_reg rt) in
+          set_reg rd (v asr shamt)
+      | LUI (rt, imm) -> set_reg rt ((imm land 0xFFFF) lsl 16)
+      | LB (rt, rs, imm) -> set_reg rt (read_byte cpu (get_reg rs + ext16 imm))
+      | LBU (rt, rs, imm) ->
+          set_reg rt (read_byte_u cpu (get_reg rs + ext16 imm))
+      | LH (rt, rs, imm) ->
+          set_reg rt (read_halfword cpu (get_reg rs + ext16 imm))
+      | LHU (rt, rs, imm) ->
+          set_reg rt (read_halfword_u cpu (get_reg rs + ext16 imm))
+      | LW (rt, rs, imm) -> set_reg rt (read_word cpu (get_reg rs + ext16 imm))
+      | LWL (rt, rs, imm) | LWR (rt, rs, imm) ->
+          let addr = get_reg rs + ext16 imm in
+          set_reg rt (read_word cpu (addr land lnot 3))
+      | SB (rt, rs, imm) -> write_byte cpu (get_reg rs + ext16 imm) (get_reg rt)
+      | SH (rt, rs, imm) ->
+          write_halfword cpu (get_reg rs + ext16 imm) (get_reg rt)
+      | SW (rt, rs, imm) -> write_word cpu (get_reg rs + ext16 imm) (get_reg rt)
+      | SWL (rt, rs, imm) | SWR (rt, rs, imm) ->
+          let addr = get_reg rs + ext16 imm in
+          write_word cpu (addr land lnot 3) (get_reg rt)
+      | BREAK -> raise_exception Break
+      | SYSCALL -> raise_exception Syscall
+      | MFC0 (rt, rd) -> set_reg rt (c0_of_reg rd)
+      | MTC0 (rt, rd) -> set_c0_reg rd (get_reg rt)
+      | MFHI rd -> set_reg rd cpu.regs.hi
+      | MFLO rd -> set_reg rd cpu.regs.lo
+      | MTHI rs -> cpu.regs.hi <- get_reg rs
+      | MTLO rs -> cpu.regs.lo <- get_reg rs
+      | J target ->
+          let target_addr = cpu.pc land 0xF0000000 lor (target lsl 2) in
           cpu.regs.delayed_branch <- Some target_addr
-    | BGEZ (rs, offset) ->
-        if ext32 (get_reg rs) >= 0 then
-          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+      | JAL target ->
+          set_reg 31 (cpu.pc + 8);
+          let target_addr = cpu.pc land 0xF0000000 lor (target lsl 2) in
           cpu.regs.delayed_branch <- Some target_addr
-    | BLTZAL (rs, offset) ->
-        set_reg 31 (cpu.pc + 8);
-        if ext32 (get_reg rs) < 0 then
-          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-          cpu.regs.delayed_branch <- Some target_addr
-    | BGEZAL (rs, offset) ->
-        set_reg 31 (cpu.pc + 8);
-        if ext32 (get_reg rs) >= 0 then
-          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-          cpu.regs.delayed_branch <- Some target_addr
-    | BEQ (rs, rt, offset) ->
-        if get_reg rs = get_reg rt then
-          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-          cpu.regs.delayed_branch <- Some target_addr
-    | BNE (rs, rt, offset) ->
-        if get_reg rs <> get_reg rt then
-          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-          cpu.regs.delayed_branch <- Some target_addr);
-    cpu.pc <- next_pc
-  with CpuException _ -> ()
-(* Any other unexpected error (Invalid_argument, etc.) is fatal and
-      propagates so we do not silently skip broken instructions. *)
+      | JALR (rd, rs) ->
+          set_reg rd (cpu.pc + 8);
+          cpu.regs.delayed_branch <- Some (get_reg rs)
+      | JR rs -> cpu.regs.delayed_branch <- Some (get_reg rs)
+      | RFE ->
+          let mode_bits = cpu.cp0.sr land 0x3F in
+          let sr_cleared = cpu.cp0.sr land lnot 0x3F in
+          cpu.cp0.sr <- sr_cleared lor ((mode_bits lsr 2) land 0x3F)
+      | BLTZ (rs, offset) ->
+          if ext32 (get_reg rs) < 0 then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BGEZ (rs, offset) ->
+          if ext32 (get_reg rs) >= 0 then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BLTZAL (rs, offset) ->
+          set_reg 31 (cpu.pc + 8);
+          if ext32 (get_reg rs) < 0 then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BGEZAL (rs, offset) ->
+          set_reg 31 (cpu.pc + 8);
+          if ext32 (get_reg rs) >= 0 then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BEQ (rs, rt, offset) ->
+          if get_reg rs = get_reg rt then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BNE (rs, rt, offset) ->
+          if get_reg rs <> get_reg rt then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BGTZ (rs, offset) ->
+          if ext32 (get_reg rs) > 0 then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | BLEZ (rs, offset) ->
+          if ext32 (get_reg rs) <= 0 then
+            let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
+            cpu.regs.delayed_branch <- Some target_addr
+      | MOVZ (rd, rs, rt) -> if get_reg rt = 0 then set_reg rd (get_reg rs)
+      | MOVN (rd, rs, rt) -> if get_reg rt <> 0 then set_reg rd (get_reg rs));
+      cpu.pc <- next_pc
+    with CpuException _ -> ())
 
 exception UnknownOpcode of int
 exception UnknownFunction of int
@@ -545,7 +743,6 @@ let parse_opcode (instr : int) : instruction =
   let funct = instr land 0x3F in
   let imm = instr land 0xFFFF in
   let target = instr land 0x3FFFFFF in
-  ignore shamt;
   match opcode with
   | 0b000000 -> (
       match funct with
@@ -559,6 +756,8 @@ let parse_opcode (instr : int) : instruction =
       | 0b100111 -> NOR (rd, rs, rt)
       | 0b101010 -> SLT (rd, rs, rt)
       | 0b101011 -> SLTU (rd, rs, rt)
+      | 0b001010 -> MOVZ (rd, rs, rt)
+      | 0b001011 -> MOVN (rd, rs, rt)
       | 0b011000 -> MULT (rs, rt)
       | 0b011001 -> MULTU (rs, rt)
       | 0b011010 -> DIV (rs, rt)
@@ -568,6 +767,11 @@ let parse_opcode (instr : int) : instruction =
       | 0b010001 -> MTHI rs
       | 0b010011 -> MTLO rs
       | 0b000000 -> SLL (rd, rt, shamt)
+      | 0b000010 -> SRL (rd, rt, shamt)
+      | 0b000011 -> SRA (rd, rt, shamt)
+      | 0b000100 -> SLLV (rd, rt, rs)
+      | 0b000110 -> SRLV (rd, rt, rs)
+      | 0b000111 -> SRAV (rd, rt, rs)
       | 0b001000 -> JR rs
       | 0b001001 -> JALR (rd, rs)
       | 0b001100 -> SYSCALL
@@ -586,13 +790,19 @@ let parse_opcode (instr : int) : instruction =
   | 0b100001 -> LH (rt, rs, imm)
   | 0b100101 -> LHU (rt, rs, imm)
   | 0b100011 -> LW (rt, rs, imm)
+  | 0b100010 -> LWL (rt, rs, imm)
+  | 0b100110 -> LWR (rt, rs, imm)
   | 0b101000 -> SB (rt, rs, imm)
   | 0b101001 -> SH (rt, rs, imm)
   | 0b101011 -> SW (rt, rs, imm)
+  | 0b101010 -> SWL (rt, rs, imm)
+  | 0b101110 -> SWR (rt, rs, imm)
   | 0b000010 -> J target
   | 0b000011 -> JAL target
   | 0b000100 -> BEQ (rs, rt, imm)
   | 0b000101 -> BNE (rs, rt, imm)
+  | 0b000111 -> BGTZ (rs, imm)
+  | 0b000110 -> BLEZ (rs, imm)
   | 0b000001 -> (
       match rt with
       | 0x10 -> BLTZAL (rs, imm)
@@ -606,8 +816,31 @@ let parse_opcode (instr : int) : instruction =
       | _ -> raise (UnknownOpcode instr))
   | _ -> raise (UnknownOpcode instr)
 
+let step_count = ref 0
+
+(* let ram_dumped = ref false
+
+let dump_ram cpu =
+  let oc = open_out_bin "/tmp/camlstation_ram.bin" in
+  for i = 0 to Array.length cpu.ram - 1 do
+    output_byte oc (cpu.ram.(i) land 0xFF)
+  done;
+  close_out oc
+*)
+let vblank_cycles = 50000
+
 let step (cpu : cpu) : unit =
-  let opcode = read_word cpu.bus cpu.pc in
+  incr step_count;
+  cpu.cycle_count <- cpu.cycle_count + 1;
+  if cpu.cycle_count mod vblank_cycles = 0 then (
+    cpu.i_stat <- cpu.i_stat lor 1;
+    (* kimi 2.7 helped me with this... could be wrong tho*)
+    (* Simulate the BIOS VBlank interrupt handler: bump the kernel VSync
+       counter.  The kernel accesses this via LUI 0x8008 + offset 0x9D9C,
+       which sign-extends to physical address 0x79D9C. *)
+    let cur = read_word_array cpu.ram 0x79D9C land 0xFFFFFFFF in
+    write_word_array cpu.ram 0x79D9C ((cur + 1) land 0xFFFFFFFF));
+  let opcode = fetch_word cpu cpu.pc in
   let instr = parse_opcode opcode in
   execute cpu instr;
-  check_for_tty_output cpu
+  handle_bios_call cpu
