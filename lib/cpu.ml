@@ -58,7 +58,6 @@ let code_of_exception (exc : cpu_exception) : int =
 
 type three = int * int * int
 type two = int * int
-type one = int
 
 type instruction =
   | ADD of three
@@ -106,15 +105,15 @@ type instruction =
   | DIV of two
   | DIVU of two
   | MFC0 of two
-  | MFHI of one
-  | MFLO of one
+  | MFHI of int 
+  | MFLO of int
   | MTC0 of two
-  | MTHI of one
-  | MTLO of one
-  | J of one
-  | JAL of one
+  | MTHI of int
+  | MTLO of int
+  | J of int
+  | JAL of int
   | JALR of two
-  | JR of one
+  | JR of int
   | RFE
   | BLTZ of two
   | BGEZ of two
