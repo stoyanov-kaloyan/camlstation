@@ -3,6 +3,7 @@ type registers = {
   mutable hi : int;
   mutable lo : int;
   mutable delayed_branch : (int * int) option;
+  mutable load_delay : (int * int * int) option;
 }
 
 type cp0 = {
@@ -144,7 +145,14 @@ let cpu_of_bios bios =
     scratchpad = Array.make 1024 0;
     cache = Array.make (4 * 1024) 0;
     pc = 0xBFC00000;
-    regs = { gp = Array.make 32 0; hi = 0; lo = 0; delayed_branch = None };
+    regs =
+      {
+        gp = Array.make 32 0;
+        hi = 0;
+        lo = 0;
+        delayed_branch = None;
+        load_delay = None;
+      };
     cp0 =
       {
         index = 0;
@@ -450,10 +458,16 @@ exception CpuException of cpu_exception
 
 (* execute mutates the state *)
 let execute (cpu : cpu) (instr : instruction) : unit =
+  let pending_load = cpu.regs.load_delay in
+  cpu.regs.load_delay <- None;
+
   let get_reg (reg_num : int) : int =
     if reg_num < 0 || reg_num >= Array.length cpu.regs.gp then
       raise (Invalid_argument "Register number out of bounds")
-    else cpu.regs.gp.(reg_num)
+    else
+      match pending_load with
+      | Some (pending_reg, _, old_value) when pending_reg = reg_num -> old_value
+      | _ -> cpu.regs.gp.(reg_num)
   in
 
   let set_reg (reg_num : int) (value : int) : unit =
@@ -518,6 +532,12 @@ let execute (cpu : cpu) (instr : instruction) : unit =
         (target, true, Some branch_pc)
     | None -> (cpu.pc + 4, false, None)
   in
+
+  (* Commit the previous instruction's load-delayed write.  The current
+     instruction still sees the old value if it reads the loaded register. *)
+  (match pending_load with
+  | Some (reg, value, _) when reg <> 0 -> cpu.regs.gp.(reg) <- value
+  | _ -> ());
 
   let raise_exception (exc : cpu_exception) : unit =
     let code = code_of_exception exc in
@@ -601,14 +621,26 @@ let execute (cpu : cpu) (instr : instruction) : unit =
       if pending <> 0 && cpu.cp0.sr land 1 <> 0 then raise_exception Interrupt
   in
   let load_word_helper rt rs imm op is_right =
-    let addr = get_reg rs + ext16 imm in
-    let word_addr = addr land lnot 3 in
-    let word = read_word cpu word_addr in
-    let shift = if is_right then addr land 3 * 8 else (3 - (addr land 3)) * 8 in
-    let mask = op 0xFFFFFFFF shift land 0xFFFFFFFF in
-    let new_value = op word shift land mask in
-    let old_value = get_reg rt land lnot mask in
-    set_reg rt (new_value lor old_value)
+    if rt <> 0 then
+      let addr = get_reg rs + ext16 imm in
+      let word_addr = addr land lnot 3 in
+      let word = read_word cpu word_addr in
+      let shift =
+        if is_right then addr land 3 * 8 else (3 - (addr land 3)) * 8
+      in
+      let mask = op 0xFFFFFFFF shift land 0xFFFFFFFF in
+      let new_value = op word shift land mask in
+      (* LWL/LWR merge with the register value. If the previous instruction is a
+         load to the same register, the merge uses the value being loaded, while
+         the next instruction still sees the old value. *)
+      let merge_base =
+        match pending_load with
+        | Some (preg, pvalue, _) when preg = rt -> pvalue
+        | _ -> get_reg rt
+      in
+      let old_value = merge_base land lnot mask in
+      cpu.regs.load_delay <-
+        Some (rt, to32 (new_value lor old_value), get_reg rt)
   in
 
   let store_word_helper rt rs imm op is_right =
@@ -693,20 +725,32 @@ let execute (cpu : cpu) (instr : instruction) : unit =
         let v = ext32 (get_reg rt) in
         set_reg rd (v asr shamt)
     | LUI (rt, imm) -> set_reg rt ((imm land 0xFFFF) lsl 16)
-    | LB (rt, rs, imm) -> set_reg rt (read_byte cpu (get_reg rs + ext16 imm))
-    | LBU (rt, rs, imm) -> set_reg rt (read_byte_u cpu (get_reg rs + ext16 imm))
+    | LB (rt, rs, imm) ->
+        if rt <> 0 then
+          let value = read_byte cpu (get_reg rs + ext16 imm) in
+          cpu.regs.load_delay <- Some (rt, to32 value, get_reg rt)
+    | LBU (rt, rs, imm) ->
+        if rt <> 0 then
+          let value = read_byte_u cpu (get_reg rs + ext16 imm) in
+          cpu.regs.load_delay <- Some (rt, to32 value, get_reg rt)
     | LH (rt, rs, imm) ->
         let addr = get_reg rs + ext16 imm in
         if addr land 1 <> 0 then raise_exception (AddressErrorLoad addr)
-        else set_reg rt (read_halfword cpu addr)
+        else if rt <> 0 then
+          let value = read_halfword cpu addr in
+          cpu.regs.load_delay <- Some (rt, to32 value, get_reg rt)
     | LHU (rt, rs, imm) ->
         let addr = get_reg rs + ext16 imm in
         if addr land 1 <> 0 then raise_exception (AddressErrorLoad addr)
-        else set_reg rt (read_halfword_u cpu addr)
+        else if rt <> 0 then
+          let value = read_halfword_u cpu addr in
+          cpu.regs.load_delay <- Some (rt, to32 value, get_reg rt)
     | LW (rt, rs, imm) ->
         let addr = get_reg rs + ext16 imm in
         if addr land 3 <> 0 then raise_exception (AddressErrorLoad addr)
-        else set_reg rt (read_word cpu addr)
+        else if rt <> 0 then
+          let value = read_word cpu addr in
+          cpu.regs.load_delay <- Some (rt, to32 value, get_reg rt)
     | LWL (rt, rs, imm) -> load_word_helper rt rs imm ( lsl ) false
     | LWR (rt, rs, imm) -> load_word_helper rt rs imm ( lsr ) true
     | SB (rt, rs, imm) -> write_byte cpu (get_reg rs + ext16 imm) (get_reg rt)
