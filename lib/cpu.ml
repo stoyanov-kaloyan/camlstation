@@ -440,6 +440,12 @@ let handle_bios_call (cpu : cpu) =
     print_char (Char.chr char_code);
     flush stdout)
 
+let calc_branch_target pc offset =
+  let sign_extended_offset =
+    if offset land 0x8000 <> 0 then offset lor lnot 0xFFFF else offset
+  in
+  pc + 4 + (sign_extended_offset lsl 2)
+
 exception CpuException of cpu_exception
 
 (* execute mutates the state *)
@@ -625,6 +631,12 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     write_word cpu word_addr (new_mem_chunk lor old_mem_chunk)
   in
 
+  let sw_sh_helper rt rs imm land_val write_op =
+    let addr = get_reg rs + ext16 imm in
+    if addr land land_val <> 0 then raise_exception (AddressErrorStore addr)
+    else write_op cpu addr (get_reg rt)
+  in
+
   try
     check_interrupts ();
     (match instr with
@@ -696,14 +708,8 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     | LWL (rt, rs, imm) -> load_word_helper rt rs imm ( lsl ) false
     | LWR (rt, rs, imm) -> load_word_helper rt rs imm ( lsr ) true
     | SB (rt, rs, imm) -> write_byte cpu (get_reg rs + ext16 imm) (get_reg rt)
-    | SH (rt, rs, imm) ->
-        let addr = get_reg rs + ext16 imm in
-        if addr land 1 <> 0 then raise_exception (AddressErrorStore addr)
-        else write_halfword cpu addr (get_reg rt)
-    | SW (rt, rs, imm) ->
-        let addr = get_reg rs + ext16 imm in
-        if addr land 3 <> 0 then raise_exception (AddressErrorStore addr)
-        else write_word cpu addr (get_reg rt)
+    | SH (rt, rs, imm) -> sw_sh_helper rt rs imm 1 write_halfword
+    | SW (rt, rs, imm) -> sw_sh_helper rt rs imm 3 write_word
     | SWL (rt, rs, imm) -> store_word_helper rt rs imm ( lsl ) false
     | SWR (rt, rs, imm) -> store_word_helper rt rs imm ( lsr ) true
     | BREAK -> raise_exception Break
@@ -738,15 +744,17 @@ let execute (cpu : cpu) (instr : instruction) : unit =
           let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
           cpu.regs.delayed_branch <- Some (target_addr, cpu.pc)
     | BLTZAL (rs, offset) ->
+        let rs_val = get_reg rs in
         set_reg 31 (cpu.pc + 8);
-        if ext32 (get_reg rs) < 0 then
-          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-          cpu.regs.delayed_branch <- Some (target_addr, cpu.pc)
+        if rs_val land 0x80000000 <> 0 then
+          cpu.regs.delayed_branch <-
+            Some (calc_branch_target cpu.pc offset, cpu.pc)
     | BGEZAL (rs, offset) ->
+        let rs_val = get_reg rs in
         set_reg 31 (cpu.pc + 8);
-        if ext32 (get_reg rs) >= 0 then
-          let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
-          cpu.regs.delayed_branch <- Some (target_addr, cpu.pc)
+        if rs_val land 0x80000000 = 0 then
+          cpu.regs.delayed_branch <-
+            Some (calc_branch_target cpu.pc offset, cpu.pc)
     | BEQ (rs, rt, offset) ->
         if get_reg rs = get_reg rt then
           let target_addr = cpu.pc + 4 + (ext16 offset lsl 2) in
