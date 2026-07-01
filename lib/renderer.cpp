@@ -100,6 +100,10 @@ private:
   int display_y = 0;
   int display_w = 320;
   int display_h = 240;
+  int display_h_start = 0x260;
+  int display_h_end = 0xC60;
+  int display_v_start = 0x018;
+  int display_v_end = 0x108;
 
   void throw_sdl_error(const char *message)
   {
@@ -219,6 +223,10 @@ private:
     if (opcode == 0x02 || opcode == 0xA0)
     {
       return 2;
+    }
+    if ((opcode & 0xE0u) == 0x80u)
+    {
+      return 3;
     }
     if ((opcode & 0xF8u) == 0x60u)
     {
@@ -357,6 +365,60 @@ private:
     fill_rect(x, y, w, h, color);
   }
 
+  void execute_gp0_vram_copy(std::uint32_t src_xy, std::uint32_t dst_xy, std::uint32_t wh)
+  {
+    const int src_x = static_cast<int>(src_xy & 0x3FFu);
+    const int src_y = static_cast<int>((src_xy >> 16) & 0x1FFu);
+    const int dst_x = static_cast<int>(dst_xy & 0x3FFu);
+    const int dst_y = static_cast<int>((dst_xy >> 16) & 0x1FFu);
+    int w = static_cast<int>(wh & 0xFFFFu);
+    int h = static_cast<int>((wh >> 16) & 0xFFFFu);
+
+    if (w <= 0)
+    {
+      w = VRAM_WIDTH;
+    }
+    if (h <= 0)
+    {
+      h = VRAM_HEIGHT;
+    }
+
+    // Use a temporary buffer to preserve correct behavior for overlapping regions.
+    std::vector<std::uint16_t> temp;
+    temp.reserve(static_cast<std::size_t>(w * h));
+    for (int y = 0; y < h; ++y)
+    {
+      for (int x = 0; x < w; ++x)
+      {
+        const int sx = src_x + x;
+        const int sy = src_y + y;
+        if (sx >= 0 && sx < VRAM_WIDTH && sy >= 0 && sy < VRAM_HEIGHT)
+        {
+          temp.push_back(vram[static_cast<std::size_t>(sy * VRAM_WIDTH + sx)]);
+        }
+        else
+        {
+          temp.push_back(0);
+        }
+      }
+    }
+
+    std::size_t idx = 0;
+    for (int y = 0; y < h; ++y)
+    {
+      for (int x = 0; x < w; ++x)
+      {
+        const int tx = dst_x + x;
+        const int ty = dst_y + y;
+        if (tx >= 0 && tx < VRAM_WIDTH && ty >= 0 && ty < VRAM_HEIGHT)
+        {
+          vram[static_cast<std::size_t>(ty * VRAM_WIDTH + tx)] = temp[idx];
+        }
+        idx += 1;
+      }
+    }
+  }
+
   void process_gp0_word(std::uint32_t word)
   {
     if (gp0_state.image_load_active)
@@ -393,6 +455,10 @@ private:
       {
         begin_gp0_image_load(gp0_state.args[0], gp0_state.args[1]);
       }
+      else if ((opcode & 0xE0u) == 0x80u)
+      {
+        execute_gp0_vram_copy(gp0_state.args[0], gp0_state.args[1], gp0_state.args[2]);
+      }
       else if ((opcode & 0xF8u) == 0x60u || (opcode & 0xF8u) == 0x68u ||
                (opcode & 0xF8u) == 0x70u || (opcode & 0xF8u) == 0x78u)
       {
@@ -418,16 +484,42 @@ private:
       display_x = static_cast<int>(word & 0x3FFu);
       display_y = static_cast<int>((word >> 10) & 0x1FFu);
       break;
+    case 0x06:
+    {
+      display_h_start = static_cast<int>(word & 0xFFFu);
+      display_h_end = static_cast<int>((word >> 12) & 0xFFFu);
+      int w = (display_h_end - display_h_start) / 8;
+      if (w > 0)
+      {
+        display_w = w;
+      }
+      break;
+    }
+    case 0x07:
+    {
+      display_v_start = static_cast<int>(word & 0x3FFu);
+      display_v_end = static_cast<int>((word >> 10) & 0x3FFu);
+      int h = display_v_end - display_v_start;
+      if (h > 0)
+      {
+        display_h = h;
+      }
+      break;
+    }
     case 0x08:
     {
-      const int hres_code = static_cast<int>((word & 0x3u) | ((word >> 4) & 0x4u));
-      display_w = (hres_code == 0 ? 256 : hres_code == 1 ? 320
-                                      : hres_code == 2   ? 512
-                                      : hres_code == 3   ? 640
-                                      : hres_code == 4   ? 368
-                                      : hres_code == 5   ? 384
-                                      : hres_code == 6   ? 512
-                                                         : 640);
+      const int hres_lo = static_cast<int>(word & 0x3u);
+      const bool hres_hi = ((word >> 6) & 0x1u) != 0;
+      if (hres_hi)
+      {
+        display_w = 368;
+      }
+      else
+      {
+        display_w = (hres_lo == 0 ? 256 : hres_lo == 1 ? 320
+                                      : hres_lo == 2   ? 512
+                                                       : 640);
+      }
       display_h = ((word >> 2) & 0x1u) ? 480 : 240;
       break;
     }
