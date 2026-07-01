@@ -963,7 +963,7 @@ let dump_ram cpu =
 let vblank_cycles = 50000
 
 let sideload_exe (cpu : cpu) : unit =
-  let exe_path = "./roms/RenderLine16BPP.exe" in
+  let exe_path = "./roms/RenderPolygon16BPP.exe" in
   let exe_file = open_in_bin exe_path in
   let exe_size = in_channel_length exe_file in
   let exe_data = really_input_string exe_file exe_size in

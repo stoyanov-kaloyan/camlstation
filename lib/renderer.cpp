@@ -41,6 +41,35 @@ public:
     submit_render_command(decode_named_command(name), {a0, a1, a2, a3});
   }
 
+  void submit_polygon_flat(int semi, int color, int xy0, int xy1, int xy2)
+  {
+    submit_render_command(RenderCommandType::PolygonFlatTri,
+                          {semi, color, xy0, xy1, xy2, 0, 0, 0});
+  }
+
+  void submit_polygon_shaded(int semi, int color0, int xy0, int color1,
+                             int xy1, int color2, int xy2)
+  {
+    submit_render_command(RenderCommandType::PolygonShadedTri,
+                          {semi, color0, xy0, color1, xy1, color2, xy2});
+  }
+
+  void submit_polygon_flat_quad(int semi, int color, int xy0, int xy1,
+                                int xy2, int xy3)
+  {
+    submit_render_command(RenderCommandType::PolygonFlatQuad,
+                          {semi, color, xy0, xy1, xy2, xy3});
+  }
+
+  void submit_polygon_shaded_quad(int semi, int color0, int xy0, int color1,
+                                  int xy1, int color2, int xy2, int color3,
+                                  int xy3)
+  {
+    submit_render_command(RenderCommandType::PolygonShadedQuad,
+                          {semi, color0, xy0, color1, xy1, color2, xy2,
+                           color3, xy3});
+  }
+
   void shutdown()
   {
     stop_requested.store(true);
@@ -67,6 +96,10 @@ private:
     Rect,
     LineFlat,
     LineShaded,
+    PolygonFlatTri,
+    PolygonShadedTri,
+    PolygonFlatQuad,
+    PolygonShadedQuad,
     VramCopy,
     ImageBegin,
     ImageWord,
@@ -80,7 +113,14 @@ private:
   struct RenderCommand
   {
     RenderCommandType type;
-    std::array<int, 4> args{};
+    std::array<int, 10> args{};
+  };
+
+  struct QuadVertex
+  {
+    int x;
+    int y;
+    std::uint16_t color;
   };
 
   struct ImageTransferState
@@ -209,7 +249,19 @@ private:
            static_cast<std::uint32_t>(b);
   }
 
-  void submit_render_command(RenderCommandType type, std::array<int, 4> args)
+  static std::uint16_t blend_rgb555(std::uint16_t src, std::uint16_t dst)
+  {
+    const std::uint16_t sr = static_cast<std::uint16_t>(src & 0x1Fu);
+    const std::uint16_t sg = static_cast<std::uint16_t>((src >> 5) & 0x1Fu);
+    const std::uint16_t sb = static_cast<std::uint16_t>((src >> 10) & 0x1Fu);
+    const std::uint16_t dr = static_cast<std::uint16_t>(dst & 0x1Fu);
+    const std::uint16_t dg = static_cast<std::uint16_t>((dst >> 5) & 0x1Fu);
+    const std::uint16_t db = static_cast<std::uint16_t>((dst >> 10) & 0x1Fu);
+    return static_cast<std::uint16_t>((sr + dr) / 2 | (((sg + dg) / 2) << 5) |
+                                      (((sb + db) / 2) << 10));
+  }
+
+  void submit_render_command(RenderCommandType type, std::array<int, 10> args)
   {
     std::lock_guard<std::mutex> lock(queue_mutex);
     render_command_queue.push(RenderCommand{type, args});
@@ -464,6 +516,153 @@ private:
     }
   }
 
+  struct TriangleVertex
+  {
+    int x;
+    int y;
+    std::uint16_t color;
+  };
+
+  void draw_filled_triangle(const TriangleVertex &v0, const TriangleVertex &v1,
+                            const TriangleVertex &v2, bool semi_transparent)
+  {
+    const int min_x = std::clamp(std::min({v0.x, v1.x, v2.x}), 0, VRAM_WIDTH - 1);
+    const int max_x = std::clamp(std::max({v0.x, v1.x, v2.x}), 0, VRAM_WIDTH - 1);
+    const int min_y = std::clamp(std::min({v0.y, v1.y, v2.y}), 0, VRAM_HEIGHT - 1);
+    const int max_y = std::clamp(std::max({v0.y, v1.y, v2.y}), 0, VRAM_HEIGHT - 1);
+
+    const int area = (v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x);
+    if (area == 0)
+    {
+      return;
+    }
+
+    const double inv_area = -1.0 / static_cast<double>(area);
+    const int r0 = static_cast<int>(v0.color & 0x1Fu);
+    const int g0 = static_cast<int>((v0.color >> 5) & 0x1Fu);
+    const int b0 = static_cast<int>((v0.color >> 10) & 0x1Fu);
+    const int r1 = static_cast<int>(v1.color & 0x1Fu);
+    const int g1 = static_cast<int>((v1.color >> 5) & 0x1Fu);
+    const int b1 = static_cast<int>((v1.color >> 10) & 0x1Fu);
+    const int r2 = static_cast<int>(v2.color & 0x1Fu);
+    const int g2 = static_cast<int>((v2.color >> 5) & 0x1Fu);
+    const int b2 = static_cast<int>((v2.color >> 10) & 0x1Fu);
+    auto edge = [](const TriangleVertex &a, const TriangleVertex &b, int px,
+                   int py) -> int
+    {
+      return (px - a.x) * (b.y - a.y) - (py - a.y) * (b.x - a.x);
+    };
+
+    for (int y = min_y; y <= max_y; ++y)
+    {
+      for (int x = min_x; x <= max_x; ++x)
+      {
+        const int w0 = edge(v1, v2, x, y);
+        const int w1 = edge(v2, v0, x, y);
+        const int w2 = edge(v0, v1, x, y);
+        const bool same_sign = (w0 >= 0 && w1 >= 0 && w2 >= 0) ||
+                               (w0 <= 0 && w1 <= 0 && w2 <= 0);
+        if (!same_sign)
+        {
+          continue;
+        }
+
+        const double a = static_cast<double>(w0) * inv_area;
+        const double b = static_cast<double>(w1) * inv_area;
+        const double c = static_cast<double>(w2) * inv_area;
+        const int r = std::clamp(static_cast<int>(std::lround(r0 * a + r1 * b + r2 * c)), 0, 31);
+        const int g = std::clamp(static_cast<int>(std::lround(g0 * a + g1 * b + g2 * c)), 0, 31);
+        const int bch = std::clamp(static_cast<int>(std::lround(b0 * a + b1 * b + b2 * c)), 0, 31);
+        std::uint16_t color = static_cast<std::uint16_t>(r | (g << 5) | (bch << 10));
+        if (semi_transparent)
+        {
+          const std::uint16_t dst = vram[static_cast<std::size_t>(y * VRAM_WIDTH + x)];
+          color = blend_rgb555(color, dst);
+        }
+        vram[static_cast<std::size_t>(y * VRAM_WIDTH + x)] = color;
+      }
+    }
+  }
+
+  void draw_filled_quad(const QuadVertex &v0, const QuadVertex &v1,
+                        const QuadVertex &v2, const QuadVertex &v3,
+                        bool semi_transparent)
+  {
+    const bool axis_aligned = v0.y == v1.y && v2.y == v3.y && v0.x == v2.x &&
+                              v1.x == v3.x;
+    if (!axis_aligned)
+    {
+      draw_filled_triangle(TriangleVertex{v0.x, v0.y, v0.color},
+                           TriangleVertex{v1.x, v1.y, v1.color},
+                           TriangleVertex{v2.x, v2.y, v2.color},
+                           semi_transparent);
+      draw_filled_triangle(TriangleVertex{v1.x, v1.y, v1.color},
+                           TriangleVertex{v2.x, v2.y, v2.color},
+                           TriangleVertex{v3.x, v3.y, v3.color},
+                           semi_transparent);
+      return;
+    }
+
+    const int left = std::min(v0.x, v2.x);
+    const int right = std::max(v1.x, v3.x);
+    const int top = std::min(v0.y, v1.y);
+    const int bottom = std::max(v2.y, v3.y);
+    const int width = right - left;
+    const int height = bottom - top;
+    if (width <= 0 || height <= 0)
+    {
+      return;
+    }
+
+    auto lerp_channel = [](int c0, int c1, double t) -> int
+    {
+      return std::clamp(static_cast<int>(std::lround(c0 + (c1 - c0) * t)), 0,
+                        31);
+    };
+
+    const int r00 = static_cast<int>(v0.color & 0x1Fu);
+    const int g00 = static_cast<int>((v0.color >> 5) & 0x1Fu);
+    const int b00 = static_cast<int>((v0.color >> 10) & 0x1Fu);
+    const int r10 = static_cast<int>(v1.color & 0x1Fu);
+    const int g10 = static_cast<int>((v1.color >> 5) & 0x1Fu);
+    const int b10 = static_cast<int>((v1.color >> 10) & 0x1Fu);
+    const int r01 = static_cast<int>(v2.color & 0x1Fu);
+    const int g01 = static_cast<int>((v2.color >> 5) & 0x1Fu);
+    const int b01 = static_cast<int>((v2.color >> 10) & 0x1Fu);
+    const int r11 = static_cast<int>(v3.color & 0x1Fu);
+    const int g11 = static_cast<int>((v3.color >> 5) & 0x1Fu);
+    const int b11 = static_cast<int>((v3.color >> 10) & 0x1Fu);
+
+    for (int y = top; y < bottom; ++y)
+    {
+      const double ty = static_cast<double>(y - top) /
+                        static_cast<double>(height);
+      for (int x = left; x < right; ++x)
+      {
+        const double tx = static_cast<double>(x - left) /
+                          static_cast<double>(width);
+        const int r_top = lerp_channel(r00, r10, tx);
+        const int g_top = lerp_channel(g00, g10, tx);
+        const int b_top = lerp_channel(b00, b10, tx);
+        const int r_bottom = lerp_channel(r01, r11, tx);
+        const int g_bottom = lerp_channel(g01, g11, tx);
+        const int b_bottom = lerp_channel(b01, b11, tx);
+        const int r = lerp_channel(r_top, r_bottom, ty);
+        const int g = lerp_channel(g_top, g_bottom, ty);
+        const int b = lerp_channel(b_top, b_bottom, ty);
+        std::uint16_t color = static_cast<std::uint16_t>(r | (g << 5) |
+                                                         (b << 10));
+        if (semi_transparent)
+        {
+          const std::uint16_t dst =
+              vram[static_cast<std::size_t>(y * VRAM_WIDTH + x)];
+          color = blend_rgb555(color, dst);
+        }
+        vram[static_cast<std::size_t>(y * VRAM_WIDTH + x)] = color;
+      }
+    }
+  }
+
   void execute_gp0_fill(std::uint32_t first_word, std::uint32_t arg0, std::uint32_t arg1)
   {
     const std::uint16_t color = rgb24_to_rgb555(first_word & 0x00FFFFFFu);
@@ -587,6 +786,74 @@ private:
                          gp0_decode_y(static_cast<std::uint32_t>(cmd.args[3])),
                          static_cast<std::uint16_t>(cmd.args[1] & 0x7FFF));
         break;
+      case RenderCommandType::PolygonFlatTri:
+      {
+        const bool semi = cmd.args[0] != 0;
+        const std::uint16_t color = static_cast<std::uint16_t>(cmd.args[1] & 0x7FFF);
+        const TriangleVertex v0{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[2])),
+                                gp0_decode_y(static_cast<std::uint32_t>(cmd.args[2])),
+                                color};
+        const TriangleVertex v1{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[3])),
+                                gp0_decode_y(static_cast<std::uint32_t>(cmd.args[3])),
+                                color};
+        const TriangleVertex v2{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[4])),
+                                gp0_decode_y(static_cast<std::uint32_t>(cmd.args[4])),
+                                color};
+        draw_filled_triangle(v0, v1, v2, semi);
+        break;
+      }
+      case RenderCommandType::PolygonShadedTri:
+      {
+        const bool semi = cmd.args[0] != 0;
+        const TriangleVertex v0{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[2])),
+                                gp0_decode_y(static_cast<std::uint32_t>(cmd.args[2])),
+                                static_cast<std::uint16_t>(cmd.args[1] & 0x7FFF)};
+        const TriangleVertex v1{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[4])),
+                                gp0_decode_y(static_cast<std::uint32_t>(cmd.args[4])),
+                                static_cast<std::uint16_t>(cmd.args[3] & 0x7FFF)};
+        const TriangleVertex v2{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[6])),
+                                gp0_decode_y(static_cast<std::uint32_t>(cmd.args[6])),
+                                static_cast<std::uint16_t>(cmd.args[5] & 0x7FFF)};
+        draw_filled_triangle(v0, v1, v2, semi);
+        break;
+      }
+      case RenderCommandType::PolygonFlatQuad:
+      {
+        const bool semi = cmd.args[0] != 0;
+        const std::uint16_t color = static_cast<std::uint16_t>(cmd.args[1] & 0x7FFF);
+        const QuadVertex v0{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[2])),
+                            gp0_decode_y(static_cast<std::uint32_t>(cmd.args[2])),
+                            color};
+        const QuadVertex v1{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[3])),
+                            gp0_decode_y(static_cast<std::uint32_t>(cmd.args[3])),
+                            color};
+        const QuadVertex v2{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[4])),
+                            gp0_decode_y(static_cast<std::uint32_t>(cmd.args[4])),
+                            color};
+        const QuadVertex v3{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[5])),
+                            gp0_decode_y(static_cast<std::uint32_t>(cmd.args[5])),
+                            color};
+        draw_filled_quad(v0, v1, v2, v3, semi);
+        break;
+      }
+      case RenderCommandType::PolygonShadedQuad:
+      {
+        const bool semi = cmd.args[0] != 0;
+        const QuadVertex v0{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[2])),
+                            gp0_decode_y(static_cast<std::uint32_t>(cmd.args[2])),
+                            static_cast<std::uint16_t>(cmd.args[1] & 0x7FFF)};
+        const QuadVertex v1{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[4])),
+                            gp0_decode_y(static_cast<std::uint32_t>(cmd.args[4])),
+                            static_cast<std::uint16_t>(cmd.args[3] & 0x7FFF)};
+        const QuadVertex v2{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[6])),
+                            gp0_decode_y(static_cast<std::uint32_t>(cmd.args[6])),
+                            static_cast<std::uint16_t>(cmd.args[5] & 0x7FFF)};
+        const QuadVertex v3{gp0_decode_x(static_cast<std::uint32_t>(cmd.args[8])),
+                            gp0_decode_y(static_cast<std::uint32_t>(cmd.args[8])),
+                            static_cast<std::uint16_t>(cmd.args[7] & 0x7FFF)};
+        draw_filled_quad(v0, v1, v2, v3, semi);
+        break;
+      }
       case RenderCommandType::VramCopy:
         execute_gp0_vram_copy(static_cast<std::uint32_t>(cmd.args[0]),
                               static_cast<std::uint32_t>(cmd.args[1]),
@@ -799,6 +1066,68 @@ extern "C" CAMLprim value renderer_submit_named(value name, value a0, value a1,
     renderer_instance->submit_named(String_val(name), Int_val(a0), Int_val(a1),
                                     Int_val(a2), Int_val(a3));
   }
+  CAMLreturn(Val_unit);
+}
+
+extern "C" CAMLprim value renderer_submit_polygon_flat(value tuple)
+{
+  CAMLparam1(tuple);
+  if (renderer_instance.get() == nullptr)
+  {
+    caml_invalid_argument("renderer_submit_polygon_flat: renderer not initialized");
+  }
+  renderer_instance->submit_polygon_flat(Int_val(Field(tuple, 0)),
+                                         Int_val(Field(tuple, 1)),
+                                         Int_val(Field(tuple, 2)),
+                                         Int_val(Field(tuple, 3)),
+                                         Int_val(Field(tuple, 4)));
+  CAMLreturn(Val_unit);
+}
+
+extern "C" CAMLprim value renderer_submit_polygon_shaded(value tuple)
+{
+  CAMLparam1(tuple);
+  if (renderer_instance.get() == nullptr)
+  {
+    caml_invalid_argument("renderer_submit_polygon_shaded: renderer not initialized");
+  }
+  renderer_instance->submit_polygon_shaded(
+      Int_val(Field(tuple, 0)), Int_val(Field(tuple, 1)),
+      Int_val(Field(tuple, 2)), Int_val(Field(tuple, 3)),
+      Int_val(Field(tuple, 4)), Int_val(Field(tuple, 5)),
+      Int_val(Field(tuple, 6)));
+  CAMLreturn(Val_unit);
+}
+
+extern "C" CAMLprim value renderer_submit_polygon_flat_quad(value tuple)
+{
+  CAMLparam1(tuple);
+  if (renderer_instance.get() == nullptr)
+  {
+    caml_invalid_argument(
+        "renderer_submit_polygon_flat_quad: renderer not initialized");
+  }
+  renderer_instance->submit_polygon_flat_quad(
+      Int_val(Field(tuple, 0)), Int_val(Field(tuple, 1)),
+      Int_val(Field(tuple, 2)), Int_val(Field(tuple, 3)),
+      Int_val(Field(tuple, 4)), Int_val(Field(tuple, 5)));
+  CAMLreturn(Val_unit);
+}
+
+extern "C" CAMLprim value renderer_submit_polygon_shaded_quad(value tuple)
+{
+  CAMLparam1(tuple);
+  if (renderer_instance.get() == nullptr)
+  {
+    caml_invalid_argument(
+        "renderer_submit_polygon_shaded_quad: renderer not initialized");
+  }
+  renderer_instance->submit_polygon_shaded_quad(
+      Int_val(Field(tuple, 0)), Int_val(Field(tuple, 1)),
+      Int_val(Field(tuple, 2)), Int_val(Field(tuple, 3)),
+      Int_val(Field(tuple, 4)), Int_val(Field(tuple, 5)),
+      Int_val(Field(tuple, 6)), Int_val(Field(tuple, 7)),
+      Int_val(Field(tuple, 8)));
   CAMLreturn(Val_unit);
 }
 
