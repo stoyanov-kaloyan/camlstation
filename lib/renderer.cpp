@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -66,6 +67,32 @@ private:
   const int WIDTH = 800;
   const int HEIGHT = 600;
 
+  enum class Gp0CommandType
+  {
+    Unknown,
+    FillVram,
+    CpuToVram,
+    VramToVram,
+    RectVar,
+    RectDot,
+    Rect8x8,
+    Rect16x16,
+    LineFlat,
+    LineFlatPolyline,
+    LineShaded,
+    LineShadedPolyline
+  };
+
+  enum class Gp1CommandType
+  {
+    Unknown,
+    Reset,
+    DisplayArea,
+    HorizontalRange,
+    VerticalRange,
+    DisplayMode
+  };
+
   struct Gp0State
   {
     std::uint32_t first_word = 0;
@@ -80,6 +107,13 @@ private:
     int image_cur_x = 0;
     int image_cur_y = 0;
     int image_words_remaining = 0;
+    bool polyline_active = false;
+    bool polyline_shaded = false;
+    bool polyline_expect_coord = false;
+    std::uint16_t polyline_last_color = 0;
+    std::uint16_t polyline_next_color = 0;
+    int polyline_last_x = 0;
+    int polyline_last_y = 0;
   };
 
   std::queue<int> command_queue;
@@ -218,25 +252,111 @@ private:
     }
   }
 
-  static int gp0_param_words(std::uint8_t opcode)
+  static int gp0_param_word_count(std::uint8_t opcode)
   {
-    if (opcode == 0x02 || opcode == 0xA0)
+    switch (gp0_decode_command(opcode))
     {
+    case Gp0CommandType::FillVram:
+    case Gp0CommandType::CpuToVram:
+    case Gp0CommandType::RectVar:
+    case Gp0CommandType::LineFlat:
+    case Gp0CommandType::LineFlatPolyline:
       return 2;
-    }
-    if ((opcode & 0xE0u) == 0x80u)
-    {
+    case Gp0CommandType::LineShaded:
+    case Gp0CommandType::LineShadedPolyline:
       return 3;
-    }
-    if ((opcode & 0xF8u) == 0x60u)
-    {
-      return 2;
-    }
-    if ((opcode & 0xF8u) == 0x68u || (opcode & 0xF8u) == 0x70u || (opcode & 0xF8u) == 0x78u)
-    {
+    case Gp0CommandType::VramToVram:
+      return 3;
+    case Gp0CommandType::RectDot:
+    case Gp0CommandType::Rect8x8:
+    case Gp0CommandType::Rect16x16:
       return 1;
+    case Gp0CommandType::Unknown:
+      return 0;
     }
     return 0;
+  }
+
+  static constexpr Gp0CommandType gp0_decode_single(std::uint8_t opcode)
+  {
+    if (opcode == 0x02)
+      return Gp0CommandType::FillVram;
+    if (opcode == 0xA0)
+      return Gp0CommandType::CpuToVram;
+    if ((opcode & 0xE0u) == 0x80u)
+      return Gp0CommandType::VramToVram;
+    if ((opcode & 0xF8u) == 0x60u)
+      return Gp0CommandType::RectVar;
+    if ((opcode & 0xF8u) == 0x68u)
+      return Gp0CommandType::RectDot;
+    if ((opcode & 0xF8u) == 0x70u)
+      return Gp0CommandType::Rect8x8;
+    if ((opcode & 0xF8u) == 0x78u)
+      return Gp0CommandType::Rect16x16;
+    if ((opcode & 0xF8u) == 0x40u)
+      return Gp0CommandType::LineFlat;
+    if ((opcode & 0xF8u) == 0x48u)
+      return Gp0CommandType::LineFlatPolyline;
+    if ((opcode & 0xF8u) == 0x50u)
+      return Gp0CommandType::LineShaded;
+    if ((opcode & 0xF8u) == 0x58u)
+      return Gp0CommandType::LineShadedPolyline;
+    return Gp0CommandType::Unknown;
+  }
+
+  static constexpr std::array<Gp0CommandType, 256> gp0_generate_decode_table()
+  {
+    std::array<Gp0CommandType, 256> table{};
+    for (int i = 0; i < 256; ++i)
+    {
+      table[i] = gp0_decode_single(static_cast<std::uint8_t>(i));
+    }
+    return table;
+  }
+
+  static Gp0CommandType gp0_decode_command(std::uint8_t opcode)
+  {
+    static constexpr auto lut = gp0_generate_decode_table();
+    return lut[opcode];
+  }
+
+  static Gp1CommandType gp1_decode_command(std::uint8_t opcode)
+  {
+    switch (opcode)
+    {
+    case 0x00:
+      return Gp1CommandType::Reset;
+    case 0x05:
+      return Gp1CommandType::DisplayArea;
+    case 0x06:
+      return Gp1CommandType::HorizontalRange;
+    case 0x07:
+      return Gp1CommandType::VerticalRange;
+    case 0x08:
+      return Gp1CommandType::DisplayMode;
+    default:
+      return Gp1CommandType::Unknown;
+    }
+  }
+
+  static bool gp0_is_polyline_terminator(std::uint32_t word)
+  {
+    return (word & 0xF000F000u) == 0x50005000u;
+  }
+
+  static int gp0_decode_x(std::uint32_t xy)
+  {
+    return static_cast<int>(xy & 0x3FFu);
+  }
+
+  static int gp0_decode_y(std::uint32_t xy)
+  {
+    return static_cast<int>((xy >> 16) & 0x1FFu);
+  }
+
+  static std::uint16_t gp0_decode_color555(std::uint32_t cmd_or_color)
+  {
+    return rgb24_to_rgb555(cmd_or_color & 0x00FFFFFFu);
   }
 
   void write_vram_pixel(int x, int y, std::uint16_t value)
@@ -308,6 +428,121 @@ private:
     }
   }
 
+  void draw_line_flat(int x0, int y0, int x1, int y1, std::uint16_t color)
+  {
+    // Bresenham with a constant color.
+    int dx = std::abs(x1 - x0);
+    int dy = -std::abs(y1 - y0);
+    int sx = (x0 < x1) ? 1 : -1;
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx + dy;
+
+    int x = x0;
+    int y = y0;
+
+    while (true)
+    {
+      write_vram_pixel(x, y, color);
+      if (x == x1 && y == y1)
+      {
+        break;
+      }
+      int e2 = 2 * err;
+      if (e2 >= dy)
+      {
+        err += dy;
+        x += sx;
+      }
+      if (e2 <= dx)
+      {
+        err += dx;
+        y += sy;
+      }
+    }
+  }
+
+  void draw_line_shaded(int x0, int y0, std::uint16_t c0, int x1, int y1, std::uint16_t c1)
+  {
+    const int steps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
+    if (steps == 0)
+    {
+      write_vram_pixel(x0, y0, c0);
+      return;
+    }
+
+    const int r0 = c0 & 0x1F;
+    const int g0 = (c0 >> 5) & 0x1F;
+    const int b0 = (c0 >> 10) & 0x1F;
+    const int r1 = c1 & 0x1F;
+    const int g1 = (c1 >> 5) & 0x1F;
+    const int b1 = (c1 >> 10) & 0x1F;
+
+    for (int i = 0; i <= steps; ++i)
+    {
+      const float t = static_cast<float>(i) / static_cast<float>(steps);
+      const int x = static_cast<int>(std::lround(x0 + (x1 - x0) * t));
+      const int y = static_cast<int>(std::lround(y0 + (y1 - y0) * t));
+      const int r = static_cast<int>(std::lround(r0 + (r1 - r0) * t));
+      const int g = static_cast<int>(std::lround(g0 + (g1 - g0) * t));
+      const int b = static_cast<int>(std::lround(b0 + (b1 - b0) * t));
+      const std::uint16_t c = static_cast<std::uint16_t>((r & 0x1F) | ((g & 0x1F) << 5) | ((b & 0x1F) << 10));
+      write_vram_pixel(x, y, c);
+    }
+  }
+
+  void execute_gp0_draw_line_flat(std::uint32_t first_word, std::uint32_t arg0, std::uint32_t arg1)
+  {
+    const std::uint16_t color = gp0_decode_color555(first_word);
+    draw_line_flat(gp0_decode_x(arg0), gp0_decode_y(arg0), gp0_decode_x(arg1), gp0_decode_y(arg1), color);
+  }
+
+  void execute_gp0_draw_line_shaded(std::uint32_t first_word, std::uint32_t arg0, std::uint32_t arg1_color, std::uint32_t arg2)
+  {
+    const std::uint16_t c0 = gp0_decode_color555(first_word);
+    const std::uint16_t c1 = gp0_decode_color555(arg1_color);
+    draw_line_shaded(gp0_decode_x(arg0), gp0_decode_y(arg0), c0,
+                     gp0_decode_x(arg2), gp0_decode_y(arg2), c1);
+  }
+
+  void process_gp0_polyline_word(std::uint32_t word)
+  {
+    if (gp0_is_polyline_terminator(word))
+    {
+      gp0_state.polyline_active = false;
+      gp0_state.polyline_shaded = false;
+      gp0_state.polyline_expect_coord = false;
+      return;
+    }
+
+    if (!gp0_state.polyline_shaded)
+    {
+      const int x = gp0_decode_x(word);
+      const int y = gp0_decode_y(word);
+      draw_line_flat(gp0_state.polyline_last_x, gp0_state.polyline_last_y,
+                     x, y, gp0_state.polyline_last_color);
+      gp0_state.polyline_last_x = x;
+      gp0_state.polyline_last_y = y;
+      return;
+    }
+
+    if (!gp0_state.polyline_expect_coord)
+    {
+      gp0_state.polyline_next_color = gp0_decode_color555(word);
+      gp0_state.polyline_expect_coord = true;
+      return;
+    }
+
+    const int x = gp0_decode_x(word);
+    const int y = gp0_decode_y(word);
+    draw_line_shaded(gp0_state.polyline_last_x, gp0_state.polyline_last_y,
+                     gp0_state.polyline_last_color,
+                     x, y, gp0_state.polyline_next_color);
+    gp0_state.polyline_last_x = x;
+    gp0_state.polyline_last_y = y;
+    gp0_state.polyline_last_color = gp0_state.polyline_next_color;
+    gp0_state.polyline_expect_coord = false;
+  }
+
   void execute_gp0_fill(std::uint32_t first_word, std::uint32_t arg0, std::uint32_t arg1)
   {
     const std::uint16_t color = rgb24_to_rgb555(first_word & 0x00FFFFFFu);
@@ -336,17 +571,17 @@ private:
 
     int w = 0;
     int h = 0;
-    if ((opcode & 0xF8u) == 0x68u)
+    if (gp0_decode_command(opcode) == Gp0CommandType::RectDot)
     {
       w = 1;
       h = 1;
     }
-    else if ((opcode & 0xF8u) == 0x70u)
+    else if (gp0_decode_command(opcode) == Gp0CommandType::Rect8x8)
     {
       w = 8;
       h = 8;
     }
-    else if ((opcode & 0xF8u) == 0x78u)
+    else if (gp0_decode_command(opcode) == Gp0CommandType::Rect16x16)
     {
       w = 16;
       h = 16;
@@ -427,12 +662,18 @@ private:
       return;
     }
 
+    if (gp0_state.polyline_active)
+    {
+      process_gp0_polyline_word(word);
+      return;
+    }
+
     if (gp0_state.words_expected == 0)
     {
       gp0_state.first_word = word;
       gp0_state.args_received = 0;
       const auto opcode = static_cast<std::uint8_t>((word >> 24) & 0xFFu);
-      gp0_state.words_expected = gp0_param_words(opcode);
+      gp0_state.words_expected = gp0_param_word_count(opcode);
       return;
     }
 
@@ -447,24 +688,55 @@ private:
     if (gp0_state.words_expected == 0)
     {
       const auto opcode = static_cast<std::uint8_t>((gp0_state.first_word >> 24) & 0xFFu);
-      if (opcode == 0x02)
+      const auto cmd = gp0_decode_command(opcode);
+      switch (cmd)
       {
+      case Gp0CommandType::LineFlat:
+        execute_gp0_draw_line_flat(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1]);
+        break;
+      case Gp0CommandType::LineFlatPolyline:
+        execute_gp0_draw_line_flat(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1]);
+        gp0_state.polyline_active = true;
+        gp0_state.polyline_shaded = false;
+        gp0_state.polyline_last_color = gp0_decode_color555(gp0_state.first_word);
+        gp0_state.polyline_last_x = gp0_decode_x(gp0_state.args[1]);
+        gp0_state.polyline_last_y = gp0_decode_y(gp0_state.args[1]);
+        gp0_state.polyline_expect_coord = false;
+        break;
+      case Gp0CommandType::LineShaded:
+        execute_gp0_draw_line_shaded(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1], gp0_state.args[2]);
+        break;
+      case Gp0CommandType::LineShadedPolyline:
+        execute_gp0_draw_line_shaded(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1], gp0_state.args[2]);
+        gp0_state.polyline_active = true;
+        gp0_state.polyline_shaded = true;
+        gp0_state.polyline_last_color = gp0_decode_color555(gp0_state.args[1]);
+        gp0_state.polyline_last_x = gp0_decode_x(gp0_state.args[2]);
+        gp0_state.polyline_last_y = gp0_decode_y(gp0_state.args[2]);
+        gp0_state.polyline_expect_coord = false;
+        break;
+      case Gp0CommandType::FillVram:
         execute_gp0_fill(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1]);
-      }
-      else if (opcode == 0xA0)
-      {
+        break;
+      case Gp0CommandType::CpuToVram:
         begin_gp0_image_load(gp0_state.args[0], gp0_state.args[1]);
-      }
-      else if ((opcode & 0xE0u) == 0x80u)
-      {
+        break;
+      case Gp0CommandType::VramToVram:
         execute_gp0_vram_copy(gp0_state.args[0], gp0_state.args[1], gp0_state.args[2]);
-      }
-      else if ((opcode & 0xF8u) == 0x60u || (opcode & 0xF8u) == 0x68u ||
-               (opcode & 0xF8u) == 0x70u || (opcode & 0xF8u) == 0x78u)
+        break;
+      case Gp0CommandType::RectVar:
+      case Gp0CommandType::RectDot:
+      case Gp0CommandType::Rect8x8:
+      case Gp0CommandType::Rect16x16:
       {
         const std::uint32_t arg0 = gp0_state.args[0];
         const std::uint32_t arg1 = gp0_state.args_received >= 2 ? gp0_state.args[1] : 0;
         execute_gp0_rect(gp0_state.first_word, opcode, arg0, arg1);
+        break;
+      }
+      case Gp0CommandType::Unknown:
+      default:
+        break;
       }
     }
   }
@@ -472,19 +744,19 @@ private:
   void process_gp1_word(std::uint32_t word)
   {
     const std::uint8_t opcode = static_cast<std::uint8_t>((word >> 24) & 0xFFu);
-    switch (opcode)
+    switch (gp1_decode_command(opcode))
     {
-    case 0x00:
+    case Gp1CommandType::Reset:
       display_x = 0;
       display_y = 0;
       display_w = 320;
       display_h = 240;
       break;
-    case 0x05:
+    case Gp1CommandType::DisplayArea:
       display_x = static_cast<int>(word & 0x3FFu);
       display_y = static_cast<int>((word >> 10) & 0x1FFu);
       break;
-    case 0x06:
+    case Gp1CommandType::HorizontalRange:
     {
       display_h_start = static_cast<int>(word & 0xFFFu);
       display_h_end = static_cast<int>((word >> 12) & 0xFFFu);
@@ -495,7 +767,7 @@ private:
       }
       break;
     }
-    case 0x07:
+    case Gp1CommandType::VerticalRange:
     {
       display_v_start = static_cast<int>(word & 0x3FFu);
       display_v_end = static_cast<int>((word >> 10) & 0x3FFu);
@@ -506,7 +778,7 @@ private:
       }
       break;
     }
-    case 0x08:
+    case Gp1CommandType::DisplayMode:
     {
       const int hres_lo = static_cast<int>(word & 0x3u);
       const bool hres_hi = ((word >> 6) & 0x1u) != 0;
@@ -523,6 +795,7 @@ private:
       display_h = ((word >> 2) & 0x1u) ? 480 : 240;
       break;
     }
+    case Gp1CommandType::Unknown:
     default:
       break;
     }
@@ -675,7 +948,7 @@ extern "C" CAMLprim value init_renderer(value unit)
   CAMLreturn(Val_unit);
 }
 
-extern "C" CAMLprim value submit_command(value command)
+extern "C" CAMLprim value submit_gp0_command(value command)
 {
   CAMLparam1(command);
   int cmd = Int_val(command);

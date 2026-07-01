@@ -41,7 +41,7 @@ type cpu_exception =
   | CoprocessorUnusable
   | ArithmeticOverflow
 
-external renderer_submit_command : int -> unit = "submit_command"
+external renderer_submit_gp0_command : int -> unit = "submit_gp0_command"
 external renderer_submit_gp1_command : int -> unit = "submit_gp1_command"
 
 let code_of_exception (exc : cpu_exception) : int =
@@ -312,7 +312,7 @@ let write_word (cpu : cpu) (addr : int) (value : int) : unit =
     | IO ->
         if p = 0x1F801810 then (
           ignore (Gpu.write_port cpu.gpu p value);
-          renderer_submit_command value)
+          renderer_submit_gp0_command value)
         else if p = 0x1F801814 then (
           ignore (Gpu.write_port cpu.gpu p value);
           renderer_submit_gp1_command value)
@@ -970,7 +970,7 @@ let dump_ram cpu =
 let vblank_cycles = 50000
 
 let sideload_exe (cpu : cpu) : unit =
-  let exe_path = "./roms/MemoryTransfer16BPP.exe" in
+  let exe_path = "./roms/RenderLine16BPP.exe" in
   let exe_file = open_in_bin exe_path in
   let exe_size = in_channel_length exe_file in
   let exe_data = really_input_string exe_file exe_size in

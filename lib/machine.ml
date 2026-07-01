@@ -2,7 +2,6 @@ open Cpu
 open Rom
 
 external init_renderer : unit -> unit = "init_renderer"
-external submit_command : int -> unit = "submit_command"
 external should_close : unit -> bool = "should_close"
 
 let bios = open_rom "./SCPH1001.BIN"
