@@ -219,6 +219,26 @@ let write_halfword_array (arr : int array) (addr : int) (value : int) : unit =
 let cache_isolated cpu = cpu.cp0.sr land 0x10000 <> 0
 let cache_addr addr = addr land 0xFFF
 
+(* Memory region type for unified address decoding *)
+type memory_region =
+  | BIOS of int
+  | Scratchpad of int
+  | RAM of int
+  | IO
+  | Invalid
+
+let resolve_region (p : int) : memory_region =
+  if p >= 0x1FC00000 && p < 0x1FC80000 then
+    BIOS (p - 0x1FC00000)
+  else if p >= 0x1F800000 && p < 0x1F800400 then
+    Scratchpad (p - 0x1F800000)
+  else if p >= 0x1F801000 && p < 0x1F802000 then
+    IO
+  else if p >= 0 && p < 0x00200000 then
+    RAM p
+  else
+    Invalid
+
 let read_word_cache cache addr =
   let a = cache_addr addr in
   ((cache.(a + 3) land 0xFF) lsl 24)
@@ -271,94 +291,89 @@ let read_word (cpu : cpu) (addr : int) : int =
   if cache_isolated cpu then read_word_cache cpu.cache addr
   else
     let p = phys_addr addr in
-    if p >= 0x1FC00000 && p < 0x1FC80000 then
-      read_word_array cpu.bios (p - 0x1FC00000)
-    else if p >= 0x1F800000 && p < 0x1F800400 then
-      read_word_array cpu.scratchpad (p - 0x1F800000)
-    else if p >= 0 && p < 0x00200000 then read_word_array cpu.ram p
-    else if p = 0x1F801810 || p = 0x1F801814 then gpu_status ()
-    else if p = 0x1F801070 then cpu.i_stat
-    else if p = 0x1F801074 then cpu.i_mask
-    else 0
+    match resolve_region p with
+    | BIOS offset -> read_word_array cpu.bios offset
+    | Scratchpad offset -> read_word_array cpu.scratchpad offset
+    | RAM offset -> read_word_array cpu.ram offset
+    | IO ->
+        if p = 0x1F801810 || p = 0x1F801814 then gpu_status ()
+        else if p = 0x1F801070 then cpu.i_stat
+        else if p = 0x1F801074 then cpu.i_mask
+        else 0
+    | Invalid -> 0
 
 let write_word (cpu : cpu) (addr : int) (value : int) : unit =
   if cache_isolated cpu then write_word_cache cpu.cache addr value
   else
     let p = phys_addr addr in
-    if p >= 0x1FC00000 && p < 0x1FC80000 then
-      write_word_array cpu.bios (p - 0x1FC00000) value
-    else if p >= 0x1F800000 && p < 0x1F800400 then
-      write_word_array cpu.scratchpad (p - 0x1F800000) value
-    else if p >= 0 && p < 0x00200000 then write_word_array cpu.ram p value
-    else if p = 0x1F801070 then cpu.i_stat <- cpu.i_stat land lnot value
-    else if p = 0x1F801074 then cpu.i_mask <- value land 0x7FF
-    else ()
+    match resolve_region p with
+    | BIOS offset -> write_word_array cpu.bios offset value
+    | Scratchpad offset -> write_word_array cpu.scratchpad offset value
+    | RAM offset -> write_word_array cpu.ram offset value
+    | IO ->
+        if p = 0x1F801070 then cpu.i_stat <- cpu.i_stat land lnot value
+        else if p = 0x1F801074 then cpu.i_mask <- value land 0x7FF
+    | Invalid -> ()
 
 let read_byte (cpu : cpu) (addr : int) : int =
   if cache_isolated cpu then read_byte_cache cpu.cache addr
   else
-    let p = phys_addr addr in
-    if p >= 0x1FC00000 && p < 0x1FC80000 then
-      read_byte_array cpu.bios (p - 0x1FC00000)
-    else if p >= 0x1F800000 && p < 0x1F800400 then
-      read_byte_array cpu.scratchpad (p - 0x1F800000)
-    else if p >= 0 && p < 0x00200000 then read_byte_array cpu.ram p
-    else 0
+    match resolve_region (phys_addr addr) with
+    | BIOS offset -> read_byte_array cpu.bios offset
+    | Scratchpad offset -> read_byte_array cpu.scratchpad offset
+    | RAM offset -> read_byte_array cpu.ram offset
+    | IO -> 0
+    | Invalid -> 0
 
 let read_byte_u (cpu : cpu) (addr : int) : int =
   if cache_isolated cpu then read_byte_u_cache cpu.cache addr
   else
-    let p = phys_addr addr in
-    if p >= 0x1FC00000 && p < 0x1FC80000 then
-      read_byte_u_array cpu.bios (p - 0x1FC00000)
-    else if p >= 0x1F800000 && p < 0x1F800400 then
-      read_byte_u_array cpu.scratchpad (p - 0x1F800000)
-    else if p >= 0 && p < 0x00200000 then read_byte_u_array cpu.ram p
-    else 0
+    match resolve_region (phys_addr addr) with
+    | BIOS offset -> read_byte_u_array cpu.bios offset
+    | Scratchpad offset -> read_byte_u_array cpu.scratchpad offset
+    | RAM offset -> read_byte_u_array cpu.ram offset
+    | IO -> 0
+    | Invalid -> 0
 
 let read_halfword (cpu : cpu) (addr : int) : int =
   if cache_isolated cpu then read_halfword_cache cpu.cache addr
   else
-    let p = phys_addr addr in
-    if p >= 0x1FC00000 && p < 0x1FC80000 then
-      read_halfword_array cpu.bios (p - 0x1FC00000)
-    else if p >= 0x1F800000 && p < 0x1F800400 then
-      read_halfword_array cpu.scratchpad (p - 0x1F800000)
-    else if p >= 0 && p < 0x00200000 then read_halfword_array cpu.ram p
-    else 0
+    match resolve_region (phys_addr addr) with
+    | BIOS offset -> read_halfword_array cpu.bios offset
+    | Scratchpad offset -> read_halfword_array cpu.scratchpad offset
+    | RAM offset -> read_halfword_array cpu.ram offset
+    | IO -> 0
+    | Invalid -> 0
 
 let read_halfword_u (cpu : cpu) (addr : int) : int =
   if cache_isolated cpu then read_halfword_u_cache cpu.cache addr
   else
-    let p = phys_addr addr in
-    if p >= 0x1FC00000 && p < 0x1FC80000 then
-      read_halfword_u_array cpu.bios (p - 0x1FC00000)
-    else if p >= 0x1F800000 && p < 0x1F800400 then
-      read_halfword_u_array cpu.scratchpad (p - 0x1F800000)
-    else if p >= 0 && p < 0x00200000 then read_halfword_u_array cpu.ram p
-    else 0
+    match resolve_region (phys_addr addr) with
+    | BIOS offset -> read_halfword_u_array cpu.bios offset
+    | Scratchpad offset -> read_halfword_u_array cpu.scratchpad offset
+    | RAM offset -> read_halfword_u_array cpu.ram offset
+    | IO -> 0
+    | Invalid -> 0
 
 let write_byte (cpu : cpu) (addr : int) (value : int) : unit =
   if cache_isolated cpu then write_byte_cache cpu.cache addr value
   else
-    let p = phys_addr addr in
-    if p >= 0x1FC00000 && p < 0x1FC80000 then
-      write_byte_array cpu.bios (p - 0x1FC00000) value
-    else if p >= 0x1F800000 && p < 0x1F800400 then
-      write_byte_array cpu.scratchpad (p - 0x1F800000) value
-    else if p >= 0 && p < 0x00200000 then write_byte_array cpu.ram p value
-    else ()
+    match resolve_region (phys_addr addr) with
+    | BIOS offset -> write_byte_array cpu.bios offset value
+    | Scratchpad offset -> write_byte_array cpu.scratchpad offset value
+    | RAM offset -> write_byte_array cpu.ram offset value
+    | IO -> ()
+    | Invalid -> ()
 
 let write_halfword (cpu : cpu) (addr : int) (value : int) : unit =
   if cache_isolated cpu then write_halfword_cache cpu.cache addr value
   else
-    let p = phys_addr addr in
-    if p >= 0x1FC00000 && p < 0x1FC80000 then
-      write_halfword_array cpu.bios (p - 0x1FC00000) value
-    else if p >= 0x1F800000 && p < 0x1F800400 then
-      write_halfword_array cpu.scratchpad (p - 0x1F800000) value
-    else if p >= 0 && p < 0x00200000 then write_halfword_array cpu.ram p value
-    else ()
+    match resolve_region (phys_addr addr) with
+    | BIOS offset -> write_halfword_array cpu.bios offset value
+    | Scratchpad offset -> write_halfword_array cpu.scratchpad offset value
+    | RAM offset -> write_halfword_array cpu.ram offset value
+    | IO -> ()
+    | Invalid -> ()
 
 let mask16 imm = imm land 0xFFFF
 
