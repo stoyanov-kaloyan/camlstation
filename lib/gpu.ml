@@ -180,11 +180,8 @@ let dma_direction_bits = function
   | DmaGpuReadToCpu -> 3
 
 let gp0_is_polygon_command (opcode : int) : bool = opcode land 0xE0 = 0x20
-
 let gp0_polygon_is_shaded (opcode : int) : bool = opcode land 0x10 <> 0
-
 let gp0_polygon_is_quad (opcode : int) : bool = opcode land 0x08 <> 0
-
 let gp0_polygon_is_semitransparent (opcode : int) : bool = opcode land 0x02 <> 0
 
 let gpustat (gpu : gpu) : int =
@@ -264,11 +261,8 @@ let gp0_decode_color555 (word : int) : int =
   rgb24_to_rgb555 (word land 0x00FFFFFF)
 
 let gp0_is_polygon_command (opcode : int) : bool = opcode land 0xE0 = 0x20
-
 let gp0_polygon_is_shaded (opcode : int) : bool = opcode land 0x10 <> 0
-
 let gp0_polygon_is_quad (opcode : int) : bool = opcode land 0x08 <> 0
-
 let gp0_polygon_is_semitransparent (opcode : int) : bool = opcode land 0x02 <> 0
 
 let gp0_is_polyline_terminator (word : int) : bool =
@@ -306,7 +300,7 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
       renderer_submit_draw_area_bottom_right gpu.drawing_area_br
   | 0xE5 -> gpu.drawing_offset <- first_word land 0x003FFFFF
   | 0xE6 -> gpu.mask_bit_setting <- first_word land 0x3
-  | _ ->
+  | _ -> (
       if gp0_is_polygon_command opcode then
         let semi = if gp0_polygon_is_semitransparent opcode then 1 else 0 in
         if gp0_polygon_is_shaded opcode then
@@ -349,25 +343,28 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
         | Gp0VramToVram, [ src_xy; dst_xy; wh ] ->
             renderer_submit CmdVramCopy src_xy dst_xy wh 0
         | Gp0RectVar, [ arg0; arg1 ] ->
-            renderer_submit CmdRect (first_word land 0x00FFFFFF) arg0 arg1 0
+            renderer_submit CmdRect
+              (if opcode land 0x02 <> 0 then 1 else 0)
+              (first_word land 0x00FFFFFF)
+              arg0 arg1
         | Gp0RectDot, [ arg0 ] ->
             renderer_submit CmdRect
+              (if opcode land 0x02 <> 0 then 1 else 0)
               (first_word land 0x00FFFFFF)
               arg0
               ((1 lsl 16) lor 1)
-              0
         | Gp0Rect8x8, [ arg0 ] ->
             renderer_submit CmdRect
+              (if opcode land 0x02 <> 0 then 1 else 0)
               (first_word land 0x00FFFFFF)
               arg0
               ((8 lsl 16) lor 8)
-              0
         | Gp0Rect16x16, [ arg0 ] ->
             renderer_submit CmdRect
+              (if opcode land 0x02 <> 0 then 1 else 0)
               (first_word land 0x00FFFFFF)
               arg0
               ((16 lsl 16) lor 16)
-              0
         | Gp0LineFlat, [ arg0; arg1 ] ->
             renderer_submit CmdLineFlat
               (gp0_decode_color555 first_word)
@@ -396,7 +393,7 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
             gpu.gp0.polyline_expect_coord <- false;
             gpu.gp0.polyline_last_color <- gp0_decode_color555 arg1_color;
             gpu.gp0.polyline_last_xy <- arg2
-          | _ -> ()
+        | _ -> ())
 
 let process_gp0_polyline_word (gpu : gpu) (word : int) : unit =
   if gp0_is_polyline_terminator word then (

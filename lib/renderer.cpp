@@ -768,17 +768,37 @@ private:
         break;
       case RenderCommandType::Rect:
       {
+        const bool semi_transparent = cmd.args[0] != 0;
         const std::uint16_t color =
-            rgb24_to_rgb555(static_cast<std::uint32_t>(cmd.args[0]) & 0x00FFFFFFu);
-        const std::uint32_t xy = static_cast<std::uint32_t>(cmd.args[1]);
-        const std::uint32_t wh = static_cast<std::uint32_t>(cmd.args[2]);
+            rgb24_to_rgb555(static_cast<std::uint32_t>(cmd.args[1]) & 0x00FFFFFFu);
+        const std::uint32_t xy = static_cast<std::uint32_t>(cmd.args[2]);
+        const std::uint32_t wh = static_cast<std::uint32_t>(cmd.args[3]);
         const int x = static_cast<int>(xy & 0x3FFu);
         const int y = static_cast<int>((xy >> 16) & 0x1FFu);
         const int w = static_cast<int>(wh & 0xFFFFu);
         const int h = static_cast<int>((wh >> 16) & 0xFFFFu);
         if (w > 0 && h > 0)
         {
-          fill_rect(x, y, w, h, color);
+          if (semi_transparent)
+          {
+            const int x0 = std::max({0, x, draw_area_left});
+            const int y0 = std::max({0, y, draw_area_top});
+            const int x1 = std::min({VRAM_WIDTH - 1, x + w - 1, draw_area_right});
+            const int y1 = std::min({VRAM_HEIGHT - 1, y + h - 1, draw_area_bottom});
+            for (int py = y0; py <= y1; ++py)
+            {
+              const int row = py * VRAM_WIDTH;
+              for (int px = x0; px <= x1; ++px)
+              {
+                const std::size_t index = static_cast<std::size_t>(row + px);
+                vram[index] = blend_rgb555(color, vram[index]);
+              }
+            }
+          }
+          else
+          {
+            fill_rect(x, y, w, h, color);
+          }
         }
         break;
       }
