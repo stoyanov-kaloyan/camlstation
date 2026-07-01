@@ -41,9 +41,6 @@ type cpu_exception =
   | CoprocessorUnusable
   | ArithmeticOverflow
 
-external renderer_submit_gp0_command : int -> unit = "submit_gp0_command"
-external renderer_submit_gp1_command : int -> unit = "submit_gp1_command"
-
 let code_of_exception (exc : cpu_exception) : int =
   match exc with
   | Interrupt -> 0
@@ -310,12 +307,8 @@ let write_word (cpu : cpu) (addr : int) (value : int) : unit =
     | Scratchpad offset -> write_word_array cpu.scratchpad offset value
     | RAM offset -> write_word_array cpu.ram offset value
     | IO ->
-        if p = 0x1F801810 then (
-          ignore (Gpu.write_port cpu.gpu p value);
-          renderer_submit_gp0_command value)
-        else if p = 0x1F801814 then (
-          ignore (Gpu.write_port cpu.gpu p value);
-          renderer_submit_gp1_command value)
+        if p = 0x1F801810 then ignore (Gpu.write_port cpu.gpu p value)
+        else if p = 0x1F801814 then ignore (Gpu.write_port cpu.gpu p value)
         else if p = 0x1F801070 then cpu.i_stat <- cpu.i_stat land lnot value
         else if p = 0x1F801074 then cpu.i_mask <- value land 0x7FF
     | Invalid -> ()

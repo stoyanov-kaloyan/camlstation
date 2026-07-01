@@ -12,6 +12,7 @@
 #include <queue>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -35,16 +36,9 @@ public:
     shutdown();
   }
 
-  void submit_command(int command)
+  void submit_named(std::string_view name, int a0, int a1, int a2, int a3)
   {
-    std::lock_guard<std::mutex> lock(queue_mutex);
-    command_queue.push(command);
-  }
-
-  void submit_gp1_command(int command)
-  {
-    std::lock_guard<std::mutex> lock(queue_mutex);
-    gp1_command_queue.push(command);
+    submit_render_command(decode_named_command(name), {a0, a1, a2, a3});
   }
 
   void shutdown()
@@ -67,38 +61,30 @@ private:
   const int WIDTH = 800;
   const int HEIGHT = 600;
 
-  enum class Gp0CommandType
+  enum class RenderCommandType
   {
-    Unknown,
-    FillVram,
-    CpuToVram,
-    VramToVram,
-    RectVar,
-    RectDot,
-    Rect8x8,
-    Rect16x16,
+    Fill,
+    Rect,
     LineFlat,
-    LineFlatPolyline,
     LineShaded,
-    LineShadedPolyline
-  };
-
-  enum class Gp1CommandType
-  {
-    Unknown,
-    Reset,
+    VramCopy,
+    ImageBegin,
+    ImageWord,
+    DisplayReset,
     DisplayArea,
-    HorizontalRange,
-    VerticalRange,
+    DisplayHRange,
+    DisplayVRange,
     DisplayMode
   };
 
-  struct Gp0State
+  struct RenderCommand
   {
-    std::uint32_t first_word = 0;
-    int words_expected = 0;
-    int args_received = 0;
-    std::array<std::uint32_t, 16> args{};
+    RenderCommandType type;
+    std::array<int, 4> args{};
+  };
+
+  struct ImageTransferState
+  {
     bool image_load_active = false;
     int image_x = 0;
     int image_y = 0;
@@ -107,17 +93,9 @@ private:
     int image_cur_x = 0;
     int image_cur_y = 0;
     int image_words_remaining = 0;
-    bool polyline_active = false;
-    bool polyline_shaded = false;
-    bool polyline_expect_coord = false;
-    std::uint16_t polyline_last_color = 0;
-    std::uint16_t polyline_next_color = 0;
-    int polyline_last_x = 0;
-    int polyline_last_y = 0;
   };
 
-  std::queue<int> command_queue;
-  std::queue<int> gp1_command_queue;
+  std::queue<RenderCommand> render_command_queue;
   std::mutex queue_mutex;
   std::atomic_bool close_requested{false};
   std::atomic_bool stop_requested{false};
@@ -129,7 +107,7 @@ private:
   Uint32 window_id = 0;
   std::vector<std::uint16_t> vram = std::vector<std::uint16_t>(static_cast<std::size_t>(VRAM_WIDTH * VRAM_HEIGHT), 0);
   std::vector<std::uint32_t> upload_pixels = std::vector<std::uint32_t>(static_cast<std::size_t>(VRAM_WIDTH * VRAM_HEIGHT), 0xFF000000u);
-  Gp0State gp0_state{};
+  ImageTransferState image_state{};
   int display_x = 0;
   int display_y = 0;
   int display_w = 320;
@@ -231,6 +209,99 @@ private:
            static_cast<std::uint32_t>(b);
   }
 
+  void submit_render_command(RenderCommandType type, std::array<int, 4> args)
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    render_command_queue.push(RenderCommand{type, args});
+  }
+
+  // FNV-1a hash function for string hashing
+  // used to efficiently map command names to enum values
+  static constexpr std::uint64_t fnv1a_const(const char *s, std::size_t n)
+  {
+    std::uint64_t h = 14695981039346656037ull;
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      h ^= static_cast<std::uint8_t>(s[i]);
+      h *= 1099511628211ull;
+    }
+    return h;
+  }
+
+  // Runtime version of FNV-1a for string_view hashing
+  static std::uint64_t fnv1a_runtime(std::string_view s)
+  {
+    std::uint64_t h = 14695981039346656037ull;
+    for (const char c : s)
+    {
+      h ^= static_cast<std::uint8_t>(c);
+      h *= 1099511628211ull;
+    }
+    return h;
+  }
+
+  static RenderCommandType decode_named_command(std::string_view name)
+  {
+    const std::uint64_t key = fnv1a_runtime(name);
+    // we hash the strings so we can switch on them and dispatch function calls
+    switch (key)
+    {
+    case fnv1a_const("fill", 4):
+      if (name == "fill")
+        return RenderCommandType::Fill;
+      break;
+    case fnv1a_const("rect", 4):
+      if (name == "rect")
+        return RenderCommandType::Rect;
+      break;
+    case fnv1a_const("line_flat", 9):
+      if (name == "line_flat")
+        return RenderCommandType::LineFlat;
+      break;
+    case fnv1a_const("line_shaded", 11):
+      if (name == "line_shaded")
+        return RenderCommandType::LineShaded;
+      break;
+    case fnv1a_const("vram_copy", 9):
+      if (name == "vram_copy")
+        return RenderCommandType::VramCopy;
+      break;
+    case fnv1a_const("image_begin", 11):
+      if (name == "image_begin")
+        return RenderCommandType::ImageBegin;
+      break;
+    case fnv1a_const("image_word", 10):
+      if (name == "image_word")
+        return RenderCommandType::ImageWord;
+      break;
+    case fnv1a_const("display_reset", 13):
+      if (name == "display_reset")
+        return RenderCommandType::DisplayReset;
+      break;
+    case fnv1a_const("display_area", 12):
+      if (name == "display_area")
+        return RenderCommandType::DisplayArea;
+      break;
+    case fnv1a_const("display_h_range", 15):
+      if (name == "display_h_range")
+        return RenderCommandType::DisplayHRange;
+      break;
+    case fnv1a_const("display_v_range", 15):
+      if (name == "display_v_range")
+        return RenderCommandType::DisplayVRange;
+      break;
+    case fnv1a_const("display_mode", 12):
+      if (name == "display_mode")
+        return RenderCommandType::DisplayMode;
+      break;
+    default:
+      break;
+    }
+
+    throw std::invalid_argument(std::string("unknown renderer command: ") +
+                                std::string(name));
+  }
+
   void fill_rect(int x, int y, int w, int h, std::uint16_t color)
   {
     if (w <= 0 || h <= 0)
@@ -252,98 +323,6 @@ private:
     }
   }
 
-  static int gp0_param_word_count(std::uint8_t opcode)
-  {
-    switch (gp0_decode_command(opcode))
-    {
-    case Gp0CommandType::FillVram:
-    case Gp0CommandType::CpuToVram:
-    case Gp0CommandType::RectVar:
-    case Gp0CommandType::LineFlat:
-    case Gp0CommandType::LineFlatPolyline:
-      return 2;
-    case Gp0CommandType::LineShaded:
-    case Gp0CommandType::LineShadedPolyline:
-      return 3;
-    case Gp0CommandType::VramToVram:
-      return 3;
-    case Gp0CommandType::RectDot:
-    case Gp0CommandType::Rect8x8:
-    case Gp0CommandType::Rect16x16:
-      return 1;
-    case Gp0CommandType::Unknown:
-      return 0;
-    }
-    return 0;
-  }
-
-  static constexpr Gp0CommandType gp0_decode_single(std::uint8_t opcode)
-  {
-    if (opcode == 0x02)
-      return Gp0CommandType::FillVram;
-    if (opcode == 0xA0)
-      return Gp0CommandType::CpuToVram;
-    if ((opcode & 0xE0u) == 0x80u)
-      return Gp0CommandType::VramToVram;
-    if ((opcode & 0xF8u) == 0x60u)
-      return Gp0CommandType::RectVar;
-    if ((opcode & 0xF8u) == 0x68u)
-      return Gp0CommandType::RectDot;
-    if ((opcode & 0xF8u) == 0x70u)
-      return Gp0CommandType::Rect8x8;
-    if ((opcode & 0xF8u) == 0x78u)
-      return Gp0CommandType::Rect16x16;
-    if ((opcode & 0xF8u) == 0x40u)
-      return Gp0CommandType::LineFlat;
-    if ((opcode & 0xF8u) == 0x48u)
-      return Gp0CommandType::LineFlatPolyline;
-    if ((opcode & 0xF8u) == 0x50u)
-      return Gp0CommandType::LineShaded;
-    if ((opcode & 0xF8u) == 0x58u)
-      return Gp0CommandType::LineShadedPolyline;
-    return Gp0CommandType::Unknown;
-  }
-
-  static constexpr std::array<Gp0CommandType, 256> gp0_generate_decode_table()
-  {
-    std::array<Gp0CommandType, 256> table{};
-    for (int i = 0; i < 256; ++i)
-    {
-      table[i] = gp0_decode_single(static_cast<std::uint8_t>(i));
-    }
-    return table;
-  }
-
-  static Gp0CommandType gp0_decode_command(std::uint8_t opcode)
-  {
-    static constexpr auto lut = gp0_generate_decode_table();
-    return lut[opcode];
-  }
-
-  static Gp1CommandType gp1_decode_command(std::uint8_t opcode)
-  {
-    switch (opcode)
-    {
-    case 0x00:
-      return Gp1CommandType::Reset;
-    case 0x05:
-      return Gp1CommandType::DisplayArea;
-    case 0x06:
-      return Gp1CommandType::HorizontalRange;
-    case 0x07:
-      return Gp1CommandType::VerticalRange;
-    case 0x08:
-      return Gp1CommandType::DisplayMode;
-    default:
-      return Gp1CommandType::Unknown;
-    }
-  }
-
-  static bool gp0_is_polyline_terminator(std::uint32_t word)
-  {
-    return (word & 0xF000F000u) == 0x50005000u;
-  }
-
   static int gp0_decode_x(std::uint32_t xy)
   {
     return static_cast<int>(xy & 0x3FFu);
@@ -352,11 +331,6 @@ private:
   static int gp0_decode_y(std::uint32_t xy)
   {
     return static_cast<int>((xy >> 16) & 0x1FFu);
-  }
-
-  static std::uint16_t gp0_decode_color555(std::uint32_t cmd_or_color)
-  {
-    return rgb24_to_rgb555(cmd_or_color & 0x00FFFFFFu);
   }
 
   void write_vram_pixel(int x, int y, std::uint16_t value)
@@ -370,38 +344,38 @@ private:
 
   void begin_gp0_image_load(std::uint32_t arg0, std::uint32_t arg1)
   {
-    gp0_state.image_x = static_cast<int>(arg0 & 0x3FFu);
-    gp0_state.image_y = static_cast<int>((arg0 >> 16) & 0x1FFu);
-    gp0_state.image_w = static_cast<int>(arg1 & 0xFFFFu);
-    gp0_state.image_h = static_cast<int>((arg1 >> 16) & 0xFFFFu);
+    image_state.image_x = static_cast<int>(arg0 & 0x3FFu);
+    image_state.image_y = static_cast<int>((arg0 >> 16) & 0x1FFu);
+    image_state.image_w = static_cast<int>(arg1 & 0xFFFFu);
+    image_state.image_h = static_cast<int>((arg1 >> 16) & 0xFFFFu);
 
-    if (gp0_state.image_w <= 0 || gp0_state.image_h <= 0)
+    if (image_state.image_w <= 0 || image_state.image_h <= 0)
     {
-      gp0_state.image_load_active = false;
-      gp0_state.image_words_remaining = 0;
+      image_state.image_load_active = false;
+      image_state.image_words_remaining = 0;
       return;
     }
 
-    const int total_pixels = gp0_state.image_w * gp0_state.image_h;
-    gp0_state.image_words_remaining = (total_pixels + 1) / 2;
-    gp0_state.image_cur_x = 0;
-    gp0_state.image_cur_y = 0;
-    gp0_state.image_load_active = gp0_state.image_words_remaining > 0;
+    const int total_pixels = image_state.image_w * image_state.image_h;
+    image_state.image_words_remaining = (total_pixels + 1) / 2;
+    image_state.image_cur_x = 0;
+    image_state.image_cur_y = 0;
+    image_state.image_load_active = image_state.image_words_remaining > 0;
   }
 
   void advance_image_cursor()
   {
-    gp0_state.image_cur_x += 1;
-    if (gp0_state.image_cur_x >= gp0_state.image_w)
+    image_state.image_cur_x += 1;
+    if (image_state.image_cur_x >= image_state.image_w)
     {
-      gp0_state.image_cur_x = 0;
-      gp0_state.image_cur_y += 1;
+      image_state.image_cur_x = 0;
+      image_state.image_cur_y += 1;
     }
   }
 
   void consume_gp0_image_word(std::uint32_t word)
   {
-    if (!gp0_state.image_load_active)
+    if (!image_state.image_load_active)
     {
       return;
     }
@@ -409,22 +383,22 @@ private:
     const std::uint16_t px0 = static_cast<std::uint16_t>(word & 0xFFFFu);
     const std::uint16_t px1 = static_cast<std::uint16_t>((word >> 16) & 0xFFFFu);
 
-    write_vram_pixel(gp0_state.image_x + gp0_state.image_cur_x,
-                     gp0_state.image_y + gp0_state.image_cur_y, px0);
+    write_vram_pixel(image_state.image_x + image_state.image_cur_x,
+                     image_state.image_y + image_state.image_cur_y, px0);
     advance_image_cursor();
 
-    if (gp0_state.image_cur_y < gp0_state.image_h)
+    if (image_state.image_cur_y < image_state.image_h)
     {
-      write_vram_pixel(gp0_state.image_x + gp0_state.image_cur_x,
-                       gp0_state.image_y + gp0_state.image_cur_y, px1);
+      write_vram_pixel(image_state.image_x + image_state.image_cur_x,
+                       image_state.image_y + image_state.image_cur_y, px1);
       advance_image_cursor();
     }
 
-    gp0_state.image_words_remaining -= 1;
-    if (gp0_state.image_words_remaining <= 0 || gp0_state.image_cur_y >= gp0_state.image_h)
+    image_state.image_words_remaining -= 1;
+    if (image_state.image_words_remaining <= 0 || image_state.image_cur_y >= image_state.image_h)
     {
-      gp0_state.image_words_remaining = 0;
-      gp0_state.image_load_active = false;
+      image_state.image_words_remaining = 0;
+      image_state.image_load_active = false;
     }
   }
 
@@ -490,59 +464,6 @@ private:
     }
   }
 
-  void execute_gp0_draw_line_flat(std::uint32_t first_word, std::uint32_t arg0, std::uint32_t arg1)
-  {
-    const std::uint16_t color = gp0_decode_color555(first_word);
-    draw_line_flat(gp0_decode_x(arg0), gp0_decode_y(arg0), gp0_decode_x(arg1), gp0_decode_y(arg1), color);
-  }
-
-  void execute_gp0_draw_line_shaded(std::uint32_t first_word, std::uint32_t arg0, std::uint32_t arg1_color, std::uint32_t arg2)
-  {
-    const std::uint16_t c0 = gp0_decode_color555(first_word);
-    const std::uint16_t c1 = gp0_decode_color555(arg1_color);
-    draw_line_shaded(gp0_decode_x(arg0), gp0_decode_y(arg0), c0,
-                     gp0_decode_x(arg2), gp0_decode_y(arg2), c1);
-  }
-
-  void process_gp0_polyline_word(std::uint32_t word)
-  {
-    if (gp0_is_polyline_terminator(word))
-    {
-      gp0_state.polyline_active = false;
-      gp0_state.polyline_shaded = false;
-      gp0_state.polyline_expect_coord = false;
-      return;
-    }
-
-    if (!gp0_state.polyline_shaded)
-    {
-      const int x = gp0_decode_x(word);
-      const int y = gp0_decode_y(word);
-      draw_line_flat(gp0_state.polyline_last_x, gp0_state.polyline_last_y,
-                     x, y, gp0_state.polyline_last_color);
-      gp0_state.polyline_last_x = x;
-      gp0_state.polyline_last_y = y;
-      return;
-    }
-
-    if (!gp0_state.polyline_expect_coord)
-    {
-      gp0_state.polyline_next_color = gp0_decode_color555(word);
-      gp0_state.polyline_expect_coord = true;
-      return;
-    }
-
-    const int x = gp0_decode_x(word);
-    const int y = gp0_decode_y(word);
-    draw_line_shaded(gp0_state.polyline_last_x, gp0_state.polyline_last_y,
-                     gp0_state.polyline_last_color,
-                     x, y, gp0_state.polyline_next_color);
-    gp0_state.polyline_last_x = x;
-    gp0_state.polyline_last_y = y;
-    gp0_state.polyline_last_color = gp0_state.polyline_next_color;
-    gp0_state.polyline_expect_coord = false;
-  }
-
   void execute_gp0_fill(std::uint32_t first_word, std::uint32_t arg0, std::uint32_t arg1)
   {
     const std::uint16_t color = rgb24_to_rgb555(first_word & 0x00FFFFFFu);
@@ -558,43 +479,6 @@ private:
     if (h == 0)
     {
       h = VRAM_HEIGHT;
-    }
-
-    fill_rect(x, y, w, h, color);
-  }
-
-  void execute_gp0_rect(std::uint32_t first_word, std::uint8_t opcode, std::uint32_t arg0, std::uint32_t arg1)
-  {
-    const std::uint16_t color = rgb24_to_rgb555(first_word & 0x00FFFFFFu);
-    const int x = static_cast<int>(arg0 & 0x3FFu);
-    const int y = static_cast<int>((arg0 >> 16) & 0x1FFu);
-
-    int w = 0;
-    int h = 0;
-    if (gp0_decode_command(opcode) == Gp0CommandType::RectDot)
-    {
-      w = 1;
-      h = 1;
-    }
-    else if (gp0_decode_command(opcode) == Gp0CommandType::Rect8x8)
-    {
-      w = 8;
-      h = 8;
-    }
-    else if (gp0_decode_command(opcode) == Gp0CommandType::Rect16x16)
-    {
-      w = 16;
-      h = 16;
-    }
-    else
-    {
-      w = static_cast<int>(arg1 & 0xFFFFu);
-      h = static_cast<int>((arg1 >> 16) & 0xFFFFu);
-    }
-
-    if (w <= 0 || h <= 0)
-    {
-      return;
     }
 
     fill_rect(x, y, w, h, color);
@@ -654,175 +538,129 @@ private:
     }
   }
 
-  void process_gp0_word(std::uint32_t word)
-  {
-    if (gp0_state.image_load_active)
-    {
-      consume_gp0_image_word(word);
-      return;
-    }
-
-    if (gp0_state.polyline_active)
-    {
-      process_gp0_polyline_word(word);
-      return;
-    }
-
-    if (gp0_state.words_expected == 0)
-    {
-      gp0_state.first_word = word;
-      gp0_state.args_received = 0;
-      const auto opcode = static_cast<std::uint8_t>((word >> 24) & 0xFFu);
-      gp0_state.words_expected = gp0_param_word_count(opcode);
-      return;
-    }
-
-    if (gp0_state.args_received < static_cast<int>(gp0_state.args.size()))
-    {
-      gp0_state.args[gp0_state.args_received] = word;
-      gp0_state.args_received += 1;
-    }
-
-    gp0_state.words_expected -= 1;
-
-    if (gp0_state.words_expected == 0)
-    {
-      const auto opcode = static_cast<std::uint8_t>((gp0_state.first_word >> 24) & 0xFFu);
-      const auto cmd = gp0_decode_command(opcode);
-      switch (cmd)
-      {
-      case Gp0CommandType::LineFlat:
-        execute_gp0_draw_line_flat(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1]);
-        break;
-      case Gp0CommandType::LineFlatPolyline:
-        execute_gp0_draw_line_flat(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1]);
-        gp0_state.polyline_active = true;
-        gp0_state.polyline_shaded = false;
-        gp0_state.polyline_last_color = gp0_decode_color555(gp0_state.first_word);
-        gp0_state.polyline_last_x = gp0_decode_x(gp0_state.args[1]);
-        gp0_state.polyline_last_y = gp0_decode_y(gp0_state.args[1]);
-        gp0_state.polyline_expect_coord = false;
-        break;
-      case Gp0CommandType::LineShaded:
-        execute_gp0_draw_line_shaded(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1], gp0_state.args[2]);
-        break;
-      case Gp0CommandType::LineShadedPolyline:
-        execute_gp0_draw_line_shaded(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1], gp0_state.args[2]);
-        gp0_state.polyline_active = true;
-        gp0_state.polyline_shaded = true;
-        gp0_state.polyline_last_color = gp0_decode_color555(gp0_state.args[1]);
-        gp0_state.polyline_last_x = gp0_decode_x(gp0_state.args[2]);
-        gp0_state.polyline_last_y = gp0_decode_y(gp0_state.args[2]);
-        gp0_state.polyline_expect_coord = false;
-        break;
-      case Gp0CommandType::FillVram:
-        execute_gp0_fill(gp0_state.first_word, gp0_state.args[0], gp0_state.args[1]);
-        break;
-      case Gp0CommandType::CpuToVram:
-        begin_gp0_image_load(gp0_state.args[0], gp0_state.args[1]);
-        break;
-      case Gp0CommandType::VramToVram:
-        execute_gp0_vram_copy(gp0_state.args[0], gp0_state.args[1], gp0_state.args[2]);
-        break;
-      case Gp0CommandType::RectVar:
-      case Gp0CommandType::RectDot:
-      case Gp0CommandType::Rect8x8:
-      case Gp0CommandType::Rect16x16:
-      {
-        const std::uint32_t arg0 = gp0_state.args[0];
-        const std::uint32_t arg1 = gp0_state.args_received >= 2 ? gp0_state.args[1] : 0;
-        execute_gp0_rect(gp0_state.first_word, opcode, arg0, arg1);
-        break;
-      }
-      case Gp0CommandType::Unknown:
-      default:
-        break;
-      }
-    }
-  }
-
-  void process_gp1_word(std::uint32_t word)
-  {
-    const std::uint8_t opcode = static_cast<std::uint8_t>((word >> 24) & 0xFFu);
-    switch (gp1_decode_command(opcode))
-    {
-    case Gp1CommandType::Reset:
-      display_x = 0;
-      display_y = 0;
-      display_w = 320;
-      display_h = 240;
-      break;
-    case Gp1CommandType::DisplayArea:
-      display_x = static_cast<int>(word & 0x3FFu);
-      display_y = static_cast<int>((word >> 10) & 0x1FFu);
-      break;
-    case Gp1CommandType::HorizontalRange:
-    {
-      display_h_start = static_cast<int>(word & 0xFFFu);
-      display_h_end = static_cast<int>((word >> 12) & 0xFFFu);
-      int w = (display_h_end - display_h_start) / 8;
-      if (w > 0)
-      {
-        display_w = w;
-      }
-      break;
-    }
-    case Gp1CommandType::VerticalRange:
-    {
-      display_v_start = static_cast<int>(word & 0x3FFu);
-      display_v_end = static_cast<int>((word >> 10) & 0x3FFu);
-      int h = display_v_end - display_v_start;
-      if (h > 0)
-      {
-        display_h = h;
-      }
-      break;
-    }
-    case Gp1CommandType::DisplayMode:
-    {
-      const int hres_lo = static_cast<int>(word & 0x3u);
-      const bool hres_hi = ((word >> 6) & 0x1u) != 0;
-      if (hres_hi)
-      {
-        display_w = 368;
-      }
-      else
-      {
-        display_w = (hres_lo == 0 ? 256 : hres_lo == 1 ? 320
-                                      : hres_lo == 2   ? 512
-                                                       : 640);
-      }
-      display_h = ((word >> 2) & 0x1u) ? 480 : 240;
-      break;
-    }
-    case Gp1CommandType::Unknown:
-    default:
-      break;
-    }
-  }
-
   void drain_commands()
   {
-    std::queue<int> pending;
-    std::queue<int> gp1_pending;
+    std::queue<RenderCommand> render_pending;
     {
       std::lock_guard<std::mutex> lock(queue_mutex);
-      pending.swap(command_queue);
-      gp1_pending.swap(gp1_command_queue);
+      render_pending.swap(render_command_queue);
     }
 
-    while (!pending.empty())
+    while (!render_pending.empty())
     {
-      const auto word = static_cast<std::uint32_t>(pending.front());
-      process_gp0_word(word);
-      pending.pop();
-    }
+      const RenderCommand cmd = render_pending.front();
+      switch (cmd.type)
+      {
+      case RenderCommandType::Fill:
+        execute_gp0_fill(static_cast<std::uint32_t>(cmd.args[0]) & 0x00FFFFFFu,
+                         static_cast<std::uint32_t>(cmd.args[1]),
+                         static_cast<std::uint32_t>(cmd.args[2]));
+        break;
+      case RenderCommandType::Rect:
+      {
+        const std::uint16_t color =
+            rgb24_to_rgb555(static_cast<std::uint32_t>(cmd.args[0]) & 0x00FFFFFFu);
+        const std::uint32_t xy = static_cast<std::uint32_t>(cmd.args[1]);
+        const std::uint32_t wh = static_cast<std::uint32_t>(cmd.args[2]);
+        const int x = static_cast<int>(xy & 0x3FFu);
+        const int y = static_cast<int>((xy >> 16) & 0x1FFu);
+        const int w = static_cast<int>(wh & 0xFFFFu);
+        const int h = static_cast<int>((wh >> 16) & 0xFFFFu);
+        if (w > 0 && h > 0)
+        {
+          fill_rect(x, y, w, h, color);
+        }
+        break;
+      }
+      case RenderCommandType::LineFlat:
+        draw_line_flat(gp0_decode_x(static_cast<std::uint32_t>(cmd.args[1])),
+                       gp0_decode_y(static_cast<std::uint32_t>(cmd.args[1])),
+                       gp0_decode_x(static_cast<std::uint32_t>(cmd.args[2])),
+                       gp0_decode_y(static_cast<std::uint32_t>(cmd.args[2])),
+                       static_cast<std::uint16_t>(cmd.args[0] & 0x7FFF));
+        break;
+      case RenderCommandType::LineShaded:
+        draw_line_shaded(gp0_decode_x(static_cast<std::uint32_t>(cmd.args[2])),
+                         gp0_decode_y(static_cast<std::uint32_t>(cmd.args[2])),
+                         static_cast<std::uint16_t>(cmd.args[0] & 0x7FFF),
+                         gp0_decode_x(static_cast<std::uint32_t>(cmd.args[3])),
+                         gp0_decode_y(static_cast<std::uint32_t>(cmd.args[3])),
+                         static_cast<std::uint16_t>(cmd.args[1] & 0x7FFF));
+        break;
+      case RenderCommandType::VramCopy:
+        execute_gp0_vram_copy(static_cast<std::uint32_t>(cmd.args[0]),
+                              static_cast<std::uint32_t>(cmd.args[1]),
+                              static_cast<std::uint32_t>(cmd.args[2]));
+        break;
+      case RenderCommandType::ImageBegin:
+        begin_gp0_image_load(static_cast<std::uint32_t>(cmd.args[0]),
+                             static_cast<std::uint32_t>(cmd.args[1]));
+        break;
+      case RenderCommandType::ImageWord:
+        consume_gp0_image_word(static_cast<std::uint32_t>(cmd.args[0]));
+        break;
+      case RenderCommandType::DisplayReset:
+        display_x = 0;
+        display_y = 0;
+        display_w = 320;
+        display_h = 240;
+        display_h_start = 0x260;
+        display_h_end = 0xC60;
+        display_v_start = 0x018;
+        display_v_end = 0x108;
+        break;
+      case RenderCommandType::DisplayArea:
+      {
+        const std::uint32_t packed = static_cast<std::uint32_t>(cmd.args[0]);
+        display_x = static_cast<int>(packed & 0x3FFu);
+        display_y = static_cast<int>((packed >> 10) & 0x1FFu);
+        break;
+      }
+      case RenderCommandType::DisplayHRange:
+      {
+        const std::uint32_t packed = static_cast<std::uint32_t>(cmd.args[0]);
+        display_h_start = static_cast<int>(packed & 0xFFFu);
+        display_h_end = static_cast<int>((packed >> 12) & 0xFFFu);
+        int w = (display_h_end - display_h_start) / 8;
+        if (w > 0)
+        {
+          display_w = w;
+        }
+        break;
+      }
+      case RenderCommandType::DisplayVRange:
+      {
+        const std::uint32_t packed = static_cast<std::uint32_t>(cmd.args[0]);
+        display_v_start = static_cast<int>(packed & 0x3FFu);
+        display_v_end = static_cast<int>((packed >> 10) & 0x3FFu);
+        int h = display_v_end - display_v_start;
+        if (h > 0)
+        {
+          display_h = h;
+        }
+        break;
+      }
+      case RenderCommandType::DisplayMode:
+      {
+        const std::uint32_t word = static_cast<std::uint32_t>(cmd.args[0]);
+        const int hres_lo = static_cast<int>(word & 0x3u);
+        const bool hres_hi = ((word >> 6) & 0x1u) != 0;
+        if (hres_hi)
+        {
+          display_w = 368;
+        }
+        else
+        {
+          display_w = (hres_lo == 0 ? 256 : hres_lo == 1 ? 320
+                                        : hres_lo == 2   ? 512
+                                                         : 640);
+        }
+        display_h = ((word >> 2) & 0x1u) ? 480 : 240;
+        break;
+      }
+      }
 
-    while (!gp1_pending.empty())
-    {
-      const auto word = static_cast<std::uint32_t>(gp1_pending.front());
-      process_gp1_word(word);
-      gp1_pending.pop();
+      render_pending.pop();
     }
   }
 
@@ -948,32 +786,18 @@ extern "C" CAMLprim value init_renderer(value unit)
   CAMLreturn(Val_unit);
 }
 
-extern "C" CAMLprim value submit_gp0_command(value command)
+extern "C" CAMLprim value renderer_submit_named(value name, value a0, value a1,
+                                                value a2, value a3)
 {
-  CAMLparam1(command);
-  int cmd = Int_val(command);
+  CAMLparam5(name, a0, a1, a2, a3);
   {
     std::lock_guard<std::mutex> lock(renderer_mutex);
     if (renderer_instance.get() == nullptr)
     {
-      caml_invalid_argument("submit_command: renderer not initialized");
+      caml_invalid_argument("renderer_submit_named: renderer not initialized");
     }
-    renderer_instance->submit_command(cmd);
-  }
-  CAMLreturn(Val_unit);
-}
-
-extern "C" CAMLprim value submit_gp1_command(value command)
-{
-  CAMLparam1(command);
-  int cmd = Int_val(command);
-  {
-    std::lock_guard<std::mutex> lock(renderer_mutex);
-    if (renderer_instance.get() == nullptr)
-    {
-      caml_invalid_argument("submit_gp1_command: renderer not initialized");
-    }
-    renderer_instance->submit_gp1_command(cmd);
+    renderer_instance->submit_named(String_val(name), Int_val(a0), Int_val(a1),
+                                    Int_val(a2), Int_val(a3));
   }
   CAMLreturn(Val_unit);
 }
