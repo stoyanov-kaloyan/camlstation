@@ -82,6 +82,12 @@ public:
                           {packed_xy, 0, 0, 0, 0, 0, 0, 0, 0, 0});
   }
 
+  void submit_draw_mode(int draw_mode)
+  {
+    submit_render_command(RenderCommandType::DrawMode,
+                          {draw_mode, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+  }
+
   void shutdown()
   {
     stop_requested.store(true);
@@ -114,6 +120,7 @@ private:
     PolygonShadedQuad,
     DrawAreaTopLeft,
     DrawAreaBottomRight,
+    DrawMode,
     VramCopy,
     ImageBegin,
     ImageWord,
@@ -166,6 +173,7 @@ private:
   int draw_area_top = 0;
   int draw_area_right = VRAM_WIDTH - 1;
   int draw_area_bottom = VRAM_HEIGHT - 1;
+  bool dither_enabled = false;
   int display_x = 0;
   int display_y = 0;
   int display_w = 320;
@@ -277,6 +285,17 @@ private:
     const std::uint16_t db = static_cast<std::uint16_t>((dst >> 10) & 0x1Fu);
     return static_cast<std::uint16_t>((sr + dr) / 2 | (((sg + dg) / 2) << 5) |
                                       (((sb + db) / 2) << 10));
+  }
+
+  static int dither_offset(int x, int y)
+  {
+    static constexpr int pattern[4][4] = {
+        {-4, 0, -3, 1},
+        {2, -2, 3, -1},
+        {-3, 1, -4, 0},
+        {3, -1, 2, -2},
+    };
+    return pattern[y & 3][x & 3];
   }
 
   bool in_draw_area(int x, int y) const
@@ -547,62 +566,89 @@ private:
     std::uint16_t color;
   };
 
+  static bool is_top_left_edge(const TriangleVertex &a, const TriangleVertex &b)
+  {
+    return (a.y < b.y) || (a.y == b.y && a.x > b.x);
+  }
+
   void draw_filled_triangle(const TriangleVertex &v0, const TriangleVertex &v1,
                             const TriangleVertex &v2, bool semi_transparent)
   {
-    const int min_x = std::clamp(std::max({0, draw_area_left, std::min({v0.x, v1.x, v2.x})}),
-                                 0, VRAM_WIDTH - 1);
-    const int max_x = std::clamp(std::min({VRAM_WIDTH - 1, draw_area_right,
-                                           std::max({v0.x, v1.x, v2.x})}),
-                                 0, VRAM_WIDTH - 1);
-    const int min_y = std::clamp(std::max({0, draw_area_top, std::min({v0.y, v1.y, v2.y})}),
-                                 0, VRAM_HEIGHT - 1);
-    const int max_y = std::clamp(std::min({VRAM_HEIGHT - 1, draw_area_bottom,
-                                           std::max({v0.y, v1.y, v2.y})}),
-                                 0, VRAM_HEIGHT - 1);
+    TriangleVertex a = v0;
+    TriangleVertex b = v1;
+    TriangleVertex c = v2;
 
-    const int area = (v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x);
+    int area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
     if (area == 0)
     {
       return;
     }
+    if (area < 0)
+    {
+      std::swap(b, c);
+      area = -area;
+    }
 
-    const double inv_area = -1.0 / static_cast<double>(area);
-    const int r0 = static_cast<int>(v0.color & 0x1Fu);
-    const int g0 = static_cast<int>((v0.color >> 5) & 0x1Fu);
-    const int b0 = static_cast<int>((v0.color >> 10) & 0x1Fu);
-    const int r1 = static_cast<int>(v1.color & 0x1Fu);
-    const int g1 = static_cast<int>((v1.color >> 5) & 0x1Fu);
-    const int b1 = static_cast<int>((v1.color >> 10) & 0x1Fu);
-    const int r2 = static_cast<int>(v2.color & 0x1Fu);
-    const int g2 = static_cast<int>((v2.color >> 5) & 0x1Fu);
-    const int b2 = static_cast<int>((v2.color >> 10) & 0x1Fu);
-    auto edge = [](const TriangleVertex &a, const TriangleVertex &b, int px,
+    const int min_x = std::clamp(std::max({0, draw_area_left, std::min({a.x, b.x, c.x})}),
+                                 0, VRAM_WIDTH - 1);
+    const int max_x = std::clamp(std::min({VRAM_WIDTH - 1, draw_area_right,
+                                           std::max({a.x, b.x, c.x})}),
+                                 0, VRAM_WIDTH - 1);
+    const int min_y = std::clamp(std::max({0, draw_area_top, std::min({a.y, b.y, c.y})}),
+                                 0, VRAM_HEIGHT - 1);
+    const int max_y = std::clamp(std::min({VRAM_HEIGHT - 1, draw_area_bottom,
+                                           std::max({a.y, b.y, c.y})}),
+                                 0, VRAM_HEIGHT - 1);
+    const double inv_area = 1.0 / static_cast<double>(area);
+    const int r0 = static_cast<int>(a.color & 0x1Fu);
+    const int g0 = static_cast<int>((a.color >> 5) & 0x1Fu);
+    const int b0 = static_cast<int>((a.color >> 10) & 0x1Fu);
+    const int r1 = static_cast<int>(b.color & 0x1Fu);
+    const int g1 = static_cast<int>((b.color >> 5) & 0x1Fu);
+    const int b1 = static_cast<int>((b.color >> 10) & 0x1Fu);
+    const int r2 = static_cast<int>(c.color & 0x1Fu);
+    const int g2 = static_cast<int>((c.color >> 5) & 0x1Fu);
+    const int b2 = static_cast<int>((c.color >> 10) & 0x1Fu);
+    auto edge = [](const TriangleVertex &p0, const TriangleVertex &p1, int px,
                    int py) -> int
     {
-      return (px - a.x) * (b.y - a.y) - (py - a.y) * (b.x - a.x);
+      return (p1.x - p0.x) * (py - p0.y) - (p1.y - p0.y) * (px - p0.x);
     };
 
     for (int y = min_y; y <= max_y; ++y)
     {
       for (int x = min_x; x <= max_x; ++x)
       {
-        const int w0 = edge(v1, v2, x, y);
-        const int w1 = edge(v2, v0, x, y);
-        const int w2 = edge(v0, v1, x, y);
-        const bool same_sign = (w0 >= 0 && w1 >= 0 && w2 >= 0) ||
-                               (w0 <= 0 && w1 <= 0 && w2 <= 0);
-        if (!same_sign)
+        const int w0 = edge(b, c, x, y);
+        const int w1 = edge(c, a, x, y);
+        const int w2 = edge(a, b, x, y);
+        const bool inside = (w0 > 0 || (w0 == 0 && is_top_left_edge(b, c))) &&
+                            (w1 > 0 || (w1 == 0 && is_top_left_edge(c, a))) &&
+                            (w2 > 0 || (w2 == 0 && is_top_left_edge(a, b)));
+        if (!inside)
         {
           continue;
         }
 
-        const double a = static_cast<double>(w0) * inv_area;
-        const double b = static_cast<double>(w1) * inv_area;
-        const double c = static_cast<double>(w2) * inv_area;
-        const int r = std::clamp(static_cast<int>(std::lround(r0 * a + r1 * b + r2 * c)), 0, 31);
-        const int g = std::clamp(static_cast<int>(std::lround(g0 * a + g1 * b + g2 * c)), 0, 31);
-        const int bch = std::clamp(static_cast<int>(std::lround(b0 * a + b1 * b + b2 * c)), 0, 31);
+        const double wa = static_cast<double>(w0) * inv_area;
+        const double wb = static_cast<double>(w1) * inv_area;
+        const double wc = static_cast<double>(w2) * inv_area;
+        int r = static_cast<int>(std::lround(r0 * wa + r1 * wb + r2 * wc));
+        int g = static_cast<int>(std::lround(g0 * wa + g1 * wb + g2 * wc));
+        int bch = static_cast<int>(std::lround(b0 * wa + b1 * wb + b2 * wc));
+        if (dither_enabled)
+        {
+          const int delta = dither_offset(x, y);
+          r = std::clamp(r + delta, 0, 31);
+          g = std::clamp(g + delta, 0, 31);
+          bch = std::clamp(bch + delta, 0, 31);
+        }
+        else
+        {
+          r = std::clamp(r, 0, 31);
+          g = std::clamp(g, 0, 31);
+          bch = std::clamp(bch, 0, 31);
+        }
         std::uint16_t color = static_cast<std::uint16_t>(r | (g << 5) | (bch << 10));
         if (semi_transparent)
         {
@@ -618,81 +664,14 @@ private:
                         const QuadVertex &v2, const QuadVertex &v3,
                         bool semi_transparent)
   {
-    const bool axis_aligned = v0.y == v1.y && v2.y == v3.y && v0.x == v2.x &&
-                              v1.x == v3.x;
-    if (!axis_aligned)
-    {
-      draw_filled_triangle(TriangleVertex{v0.x, v0.y, v0.color},
-                           TriangleVertex{v1.x, v1.y, v1.color},
-                           TriangleVertex{v2.x, v2.y, v2.color},
-                           semi_transparent);
-      draw_filled_triangle(TriangleVertex{v1.x, v1.y, v1.color},
-                           TriangleVertex{v2.x, v2.y, v2.color},
-                           TriangleVertex{v3.x, v3.y, v3.color},
-                           semi_transparent);
-      return;
-    }
-
-    const int left = std::max({0, draw_area_left, std::min(v0.x, v2.x)});
-    const int right = std::min({VRAM_WIDTH - 1, draw_area_right,
-                                std::max(v1.x, v3.x)});
-    const int top = std::max({0, draw_area_top, std::min(v0.y, v1.y)});
-    const int bottom = std::min({VRAM_HEIGHT - 1, draw_area_bottom,
-                                 std::max(v2.y, v3.y)});
-    const int width = right - left;
-    const int height = bottom - top;
-    if (width <= 0 || height <= 0)
-    {
-      return;
-    }
-
-    auto lerp_channel = [](int c0, int c1, double t) -> int
-    {
-      return std::clamp(static_cast<int>(std::lround(c0 + (c1 - c0) * t)), 0,
-                        31);
-    };
-
-    const int r00 = static_cast<int>(v0.color & 0x1Fu);
-    const int g00 = static_cast<int>((v0.color >> 5) & 0x1Fu);
-    const int b00 = static_cast<int>((v0.color >> 10) & 0x1Fu);
-    const int r10 = static_cast<int>(v1.color & 0x1Fu);
-    const int g10 = static_cast<int>((v1.color >> 5) & 0x1Fu);
-    const int b10 = static_cast<int>((v1.color >> 10) & 0x1Fu);
-    const int r01 = static_cast<int>(v2.color & 0x1Fu);
-    const int g01 = static_cast<int>((v2.color >> 5) & 0x1Fu);
-    const int b01 = static_cast<int>((v2.color >> 10) & 0x1Fu);
-    const int r11 = static_cast<int>(v3.color & 0x1Fu);
-    const int g11 = static_cast<int>((v3.color >> 5) & 0x1Fu);
-    const int b11 = static_cast<int>((v3.color >> 10) & 0x1Fu);
-
-    for (int y = top; y < bottom; ++y)
-    {
-      const double ty = static_cast<double>(y - top) /
-                        static_cast<double>(height);
-      for (int x = left; x < right; ++x)
-      {
-        const double tx = static_cast<double>(x - left) /
-                          static_cast<double>(width);
-        const int r_top = lerp_channel(r00, r10, tx);
-        const int g_top = lerp_channel(g00, g10, tx);
-        const int b_top = lerp_channel(b00, b10, tx);
-        const int r_bottom = lerp_channel(r01, r11, tx);
-        const int g_bottom = lerp_channel(g01, g11, tx);
-        const int b_bottom = lerp_channel(b01, b11, tx);
-        const int r = lerp_channel(r_top, r_bottom, ty);
-        const int g = lerp_channel(g_top, g_bottom, ty);
-        const int b = lerp_channel(b_top, b_bottom, ty);
-        std::uint16_t color = static_cast<std::uint16_t>(r | (g << 5) |
-                                                         (b << 10));
-        if (semi_transparent)
-        {
-          const std::uint16_t dst =
-              vram[static_cast<std::size_t>(y * VRAM_WIDTH + x)];
-          color = blend_rgb555(color, dst);
-        }
-        vram[static_cast<std::size_t>(y * VRAM_WIDTH + x)] = color;
-      }
-    }
+    draw_filled_triangle(TriangleVertex{v0.x, v0.y, v0.color},
+                         TriangleVertex{v1.x, v1.y, v1.color},
+                         TriangleVertex{v2.x, v2.y, v2.color},
+                         semi_transparent);
+    draw_filled_triangle(TriangleVertex{v1.x, v1.y, v1.color},
+                         TriangleVertex{v2.x, v2.y, v2.color},
+                         TriangleVertex{v3.x, v3.y, v3.color},
+                         semi_transparent);
   }
 
   void execute_gp0_fill(std::uint32_t first_word, std::uint32_t arg0, std::uint32_t arg1)
@@ -926,6 +905,9 @@ private:
         draw_area_bottom = static_cast<int>((packed >> 10) & 0x3FFu);
         break;
       }
+      case RenderCommandType::DrawMode:
+        dither_enabled = (static_cast<std::uint32_t>(cmd.args[0]) & (1u << 9)) != 0;
+        break;
       case RenderCommandType::DisplayArea:
       {
         const std::uint32_t packed = static_cast<std::uint32_t>(cmd.args[0]);
@@ -1202,6 +1184,17 @@ extern "C" CAMLprim value renderer_submit_draw_area_bottom_right(value packed_xy
         "renderer_submit_draw_area_bottom_right: renderer not initialized");
   }
   renderer_instance->submit_draw_area_bottom_right(Int_val(packed_xy));
+  CAMLreturn(Val_unit);
+}
+
+extern "C" CAMLprim value renderer_submit_draw_mode(value draw_mode)
+{
+  CAMLparam1(draw_mode);
+  if (renderer_instance.get() == nullptr)
+  {
+    caml_invalid_argument("renderer_submit_draw_mode: renderer not initialized");
+  }
+  renderer_instance->submit_draw_mode(Int_val(draw_mode));
   CAMLreturn(Val_unit);
 }
 

@@ -52,6 +52,8 @@ external renderer_submit_draw_area_top_left : int -> unit
 external renderer_submit_draw_area_bottom_right : int -> unit
   = "renderer_submit_draw_area_bottom_right"
 
+external renderer_submit_draw_mode : int -> unit = "renderer_submit_draw_mode"
+
 let renderer_submit (cmd : renderer_command_name) (a0 : int) (a1 : int)
     (a2 : int) (a3 : int) : unit =
   renderer_submit_named (renderer_command_name_to_string cmd) a0 a1 a2 a3
@@ -292,12 +294,14 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
   | 0x00 -> ()
   | 0x01 -> ()
   | 0x1F -> gpu.irq <- true
-  | 0xE1 -> gpu.draw_mode <- first_word land 0x7FF
+  | 0xE1 ->
+      gpu.draw_mode <- first_word land 0x7FF;
+      renderer_submit_draw_mode gpu.draw_mode
   | 0xE2 -> gpu.texture_window <- first_word land 0xFFFFF
-    | 0xE3 ->
+  | 0xE3 ->
       gpu.drawing_area_tl <- first_word land 0x000FFFFF;
       renderer_submit_draw_area_top_left gpu.drawing_area_tl
-    | 0xE4 ->
+  | 0xE4 ->
       gpu.drawing_area_br <- first_word land 0x000FFFFF;
       renderer_submit_draw_area_bottom_right gpu.drawing_area_br
   | 0xE5 -> gpu.drawing_offset <- first_word land 0x003FFFFF
