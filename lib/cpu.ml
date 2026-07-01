@@ -41,6 +41,9 @@ type cpu_exception =
   | CoprocessorUnusable
   | ArithmeticOverflow
 
+external renderer_submit_command : int -> unit = "submit_command"
+external renderer_submit_gp1_command : int -> unit = "submit_gp1_command"
+
 let code_of_exception (exc : cpu_exception) : int =
   match exc with
   | Interrupt -> 0
@@ -130,6 +133,7 @@ type cpu = {
   mutable bios : int array;
   mutable scratchpad : int array;
   mutable cache : int array;
+  mutable gpu : Gpu.gpu;
   mutable pc : int;
   mutable regs : registers;
   mutable cp0 : cp0;
@@ -144,6 +148,7 @@ let cpu_of_bios bios =
     bios;
     scratchpad = Array.make 1024 0;
     cache = Array.make (4 * 1024) 0;
+    gpu = Gpu.create ();
     pc = 0xBFC00000;
     regs =
       {
@@ -228,16 +233,11 @@ type memory_region =
   | Invalid
 
 let resolve_region (p : int) : memory_region =
-  if p >= 0x1FC00000 && p < 0x1FC80000 then
-    BIOS (p - 0x1FC00000)
-  else if p >= 0x1F800000 && p < 0x1F800400 then
-    Scratchpad (p - 0x1F800000)
-  else if p >= 0x1F801000 && p < 0x1F802000 then
-    IO
-  else if p >= 0 && p < 0x00200000 then
-    RAM p
-  else
-    Invalid
+  if p >= 0x1FC00000 && p < 0x1FC80000 then BIOS (p - 0x1FC00000)
+  else if p >= 0x1F800000 && p < 0x1F800400 then Scratchpad (p - 0x1F800000)
+  else if p >= 0x1F801000 && p < 0x1F802000 then IO
+  else if p >= 0 && p < 0x00200000 then RAM p
+  else Invalid
 
 let read_word_cache cache addr =
   let a = cache_addr addr in
@@ -285,8 +285,6 @@ let fetch_word (cpu : cpu) (addr : int) : int =
   else if p >= 0 && p < 0x00200000 then read_word_array cpu.ram p
   else 0
 
-let gpu_status () = 0x1C000000
-
 let read_word (cpu : cpu) (addr : int) : int =
   if cache_isolated cpu then read_word_cache cpu.cache addr
   else
@@ -296,7 +294,8 @@ let read_word (cpu : cpu) (addr : int) : int =
     | Scratchpad offset -> read_word_array cpu.scratchpad offset
     | RAM offset -> read_word_array cpu.ram offset
     | IO ->
-        if p = 0x1F801810 || p = 0x1F801814 then gpu_status ()
+        if p = 0x1F801810 || p = 0x1F801814 then
+          Option.value ~default:0 (Gpu.read_port cpu.gpu p)
         else if p = 0x1F801070 then cpu.i_stat
         else if p = 0x1F801074 then cpu.i_mask
         else 0
@@ -311,7 +310,13 @@ let write_word (cpu : cpu) (addr : int) (value : int) : unit =
     | Scratchpad offset -> write_word_array cpu.scratchpad offset value
     | RAM offset -> write_word_array cpu.ram offset value
     | IO ->
-        if p = 0x1F801070 then cpu.i_stat <- cpu.i_stat land lnot value
+        if p = 0x1F801810 then (
+          ignore (Gpu.write_port cpu.gpu p value);
+          renderer_submit_command value)
+        else if p = 0x1F801814 then (
+          ignore (Gpu.write_port cpu.gpu p value);
+          renderer_submit_gp1_command value)
+        else if p = 0x1F801070 then cpu.i_stat <- cpu.i_stat land lnot value
         else if p = 0x1F801074 then cpu.i_mask <- value land 0x7FF
     | Invalid -> ()
 
@@ -1003,7 +1008,7 @@ let sideloaded = ref false
 let step (cpu : cpu) : unit =
   incr step_count;
   cpu.cycle_count <- cpu.cycle_count + 1;
-  if cpu.cycle_count mod vblank_cycles = 0 then (
+  if cpu.cycle_count mod vblank_cycles = 0 && cpu.i_stat land 1 = 0 then (
     cpu.i_stat <- cpu.i_stat lor 1;
     (* kimi 2.7 helped me with this... could be wrong tho*)
     (* Simulate the BIOS VBlank interrupt handler: bump the kernel VSync

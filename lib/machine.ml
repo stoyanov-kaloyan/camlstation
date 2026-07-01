@@ -16,7 +16,4 @@ let run_machine () =
       loop ())
   in
   init_renderer ();
-  submit_command 42;
-  submit_command 54;
-  submit_command 99;
   loop ()
