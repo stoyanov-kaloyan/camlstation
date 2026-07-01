@@ -70,6 +70,18 @@ public:
                            color3, xy3});
   }
 
+  void submit_draw_area_top_left(int packed_xy)
+  {
+    submit_render_command(RenderCommandType::DrawAreaTopLeft,
+                          {packed_xy, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+  }
+
+  void submit_draw_area_bottom_right(int packed_xy)
+  {
+    submit_render_command(RenderCommandType::DrawAreaBottomRight,
+                          {packed_xy, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+  }
+
   void shutdown()
   {
     stop_requested.store(true);
@@ -100,6 +112,8 @@ private:
     PolygonShadedTri,
     PolygonFlatQuad,
     PolygonShadedQuad,
+    DrawAreaTopLeft,
+    DrawAreaBottomRight,
     VramCopy,
     ImageBegin,
     ImageWord,
@@ -148,6 +162,10 @@ private:
   std::vector<std::uint16_t> vram = std::vector<std::uint16_t>(static_cast<std::size_t>(VRAM_WIDTH * VRAM_HEIGHT), 0);
   std::vector<std::uint32_t> upload_pixels = std::vector<std::uint32_t>(static_cast<std::size_t>(VRAM_WIDTH * VRAM_HEIGHT), 0xFF000000u);
   ImageTransferState image_state{};
+  int draw_area_left = 0;
+  int draw_area_top = 0;
+  int draw_area_right = VRAM_WIDTH - 1;
+  int draw_area_bottom = VRAM_HEIGHT - 1;
   int display_x = 0;
   int display_y = 0;
   int display_w = 320;
@@ -261,6 +279,12 @@ private:
                                       (((sb + db) / 2) << 10));
   }
 
+  bool in_draw_area(int x, int y) const
+  {
+    return x >= draw_area_left && x <= draw_area_right &&
+           y >= draw_area_top && y <= draw_area_bottom;
+  }
+
   void submit_render_command(RenderCommandType type, std::array<int, 10> args)
   {
     std::lock_guard<std::mutex> lock(queue_mutex);
@@ -361,14 +385,14 @@ private:
       return;
     }
 
-    const int x0 = std::max(0, x);
-    const int y0 = std::max(0, y);
-    const int x1 = std::min(VRAM_WIDTH, x + w);
-    const int y1 = std::min(VRAM_HEIGHT, y + h);
-    for (int py = y0; py < y1; ++py)
+    const int x0 = std::max({0, x, draw_area_left});
+    const int y0 = std::max({0, y, draw_area_top});
+    const int x1 = std::min({VRAM_WIDTH - 1, x + w - 1, draw_area_right});
+    const int y1 = std::min({VRAM_HEIGHT - 1, y + h - 1, draw_area_bottom});
+    for (int py = y0; py <= y1; ++py)
     {
       const int row = py * VRAM_WIDTH;
-      for (int px = x0; px < x1; ++px)
+      for (int px = x0; px <= x1; ++px)
       {
         vram[static_cast<std::size_t>(row + px)] = color;
       }
@@ -526,10 +550,16 @@ private:
   void draw_filled_triangle(const TriangleVertex &v0, const TriangleVertex &v1,
                             const TriangleVertex &v2, bool semi_transparent)
   {
-    const int min_x = std::clamp(std::min({v0.x, v1.x, v2.x}), 0, VRAM_WIDTH - 1);
-    const int max_x = std::clamp(std::max({v0.x, v1.x, v2.x}), 0, VRAM_WIDTH - 1);
-    const int min_y = std::clamp(std::min({v0.y, v1.y, v2.y}), 0, VRAM_HEIGHT - 1);
-    const int max_y = std::clamp(std::max({v0.y, v1.y, v2.y}), 0, VRAM_HEIGHT - 1);
+    const int min_x = std::clamp(std::max({0, draw_area_left, std::min({v0.x, v1.x, v2.x})}),
+                                 0, VRAM_WIDTH - 1);
+    const int max_x = std::clamp(std::min({VRAM_WIDTH - 1, draw_area_right,
+                                           std::max({v0.x, v1.x, v2.x})}),
+                                 0, VRAM_WIDTH - 1);
+    const int min_y = std::clamp(std::max({0, draw_area_top, std::min({v0.y, v1.y, v2.y})}),
+                                 0, VRAM_HEIGHT - 1);
+    const int max_y = std::clamp(std::min({VRAM_HEIGHT - 1, draw_area_bottom,
+                                           std::max({v0.y, v1.y, v2.y})}),
+                                 0, VRAM_HEIGHT - 1);
 
     const int area = (v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x);
     if (area == 0)
@@ -603,10 +633,12 @@ private:
       return;
     }
 
-    const int left = std::min(v0.x, v2.x);
-    const int right = std::max(v1.x, v3.x);
-    const int top = std::min(v0.y, v1.y);
-    const int bottom = std::max(v2.y, v3.y);
+    const int left = std::max({0, draw_area_left, std::min(v0.x, v2.x)});
+    const int right = std::min({VRAM_WIDTH - 1, draw_area_right,
+                                std::max(v1.x, v3.x)});
+    const int top = std::max({0, draw_area_top, std::min(v0.y, v1.y)});
+    const int bottom = std::min({VRAM_HEIGHT - 1, draw_area_bottom,
+                                 std::max(v2.y, v3.y)});
     const int width = right - left;
     const int height = bottom - top;
     if (width <= 0 || height <= 0)
@@ -875,7 +907,25 @@ private:
         display_h_end = 0xC60;
         display_v_start = 0x018;
         display_v_end = 0x108;
+        draw_area_left = 0;
+        draw_area_top = 0;
+        draw_area_right = VRAM_WIDTH - 1;
+        draw_area_bottom = VRAM_HEIGHT - 1;
         break;
+      case RenderCommandType::DrawAreaTopLeft:
+      {
+        const std::uint32_t packed = static_cast<std::uint32_t>(cmd.args[0]);
+        draw_area_left = static_cast<int>(packed & 0x3FFu);
+        draw_area_top = static_cast<int>((packed >> 10) & 0x3FFu);
+        break;
+      }
+      case RenderCommandType::DrawAreaBottomRight:
+      {
+        const std::uint32_t packed = static_cast<std::uint32_t>(cmd.args[0]);
+        draw_area_right = static_cast<int>(packed & 0x3FFu);
+        draw_area_bottom = static_cast<int>((packed >> 10) & 0x3FFu);
+        break;
+      }
       case RenderCommandType::DisplayArea:
       {
         const std::uint32_t packed = static_cast<std::uint32_t>(cmd.args[0]);
@@ -1128,6 +1178,30 @@ extern "C" CAMLprim value renderer_submit_polygon_shaded_quad(value tuple)
       Int_val(Field(tuple, 4)), Int_val(Field(tuple, 5)),
       Int_val(Field(tuple, 6)), Int_val(Field(tuple, 7)),
       Int_val(Field(tuple, 8)));
+  CAMLreturn(Val_unit);
+}
+
+extern "C" CAMLprim value renderer_submit_draw_area_top_left(value packed_xy)
+{
+  CAMLparam1(packed_xy);
+  if (renderer_instance.get() == nullptr)
+  {
+    caml_invalid_argument(
+        "renderer_submit_draw_area_top_left: renderer not initialized");
+  }
+  renderer_instance->submit_draw_area_top_left(Int_val(packed_xy));
+  CAMLreturn(Val_unit);
+}
+
+extern "C" CAMLprim value renderer_submit_draw_area_bottom_right(value packed_xy)
+{
+  CAMLparam1(packed_xy);
+  if (renderer_instance.get() == nullptr)
+  {
+    caml_invalid_argument(
+        "renderer_submit_draw_area_bottom_right: renderer not initialized");
+  }
+  renderer_instance->submit_draw_area_bottom_right(Int_val(packed_xy));
   CAMLreturn(Val_unit);
 }
 
