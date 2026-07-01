@@ -1,2 +1,8 @@
 (library
- (name camlstation))
+ (name camlstation)
+ (foreign_stubs
+  (language cxx)
+    (names renderer)
+    (flags :standard -std=c++23 -I/usr/local/include))
+ (libraries ctypes ctypes-foreign)
+ (c_library_flags :standard -L/usr/local/lib -Wl,-rpath,/usr/local/lib -lSDL3))

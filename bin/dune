@@ -2,4 +2,5 @@
  (public_name camlstation)
  (name main)
  (modes byte exe)
- (libraries camlstation))
+ (libraries camlstation)
+ (link_flags -linkall))
