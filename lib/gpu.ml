@@ -1,62 +1,6 @@
 type dma_direction = DmaOff | DmaFifo | DmaCpuToGp0 | DmaGpuReadToCpu
 
-type renderer_command_name =
-  | CmdFill
-  | CmdRect
-  | CmdLineFlat
-  | CmdLineShaded
-  | CmdVramCopy
-  | CmdImageBegin
-  | CmdImageWord
-  | CmdDisplayReset
-  | CmdDisplayArea
-  | CmdDisplayHRange
-  | CmdDisplayVRange
-  | CmdDisplayMode
-
-let renderer_command_name_to_string = function
-  | CmdFill -> "fill"
-  | CmdRect -> "rect"
-  | CmdLineFlat -> "line_flat"
-  | CmdLineShaded -> "line_shaded"
-  | CmdVramCopy -> "vram_copy"
-  | CmdImageBegin -> "image_begin"
-  | CmdImageWord -> "image_word"
-  | CmdDisplayReset -> "display_reset"
-  | CmdDisplayArea -> "display_area"
-  | CmdDisplayHRange -> "display_h_range"
-  | CmdDisplayVRange -> "display_v_range"
-  | CmdDisplayMode -> "display_mode"
-
-external renderer_submit_named : string -> int -> int -> int -> int -> unit
-  = "renderer_submit_named"
-
-external renderer_submit_polygon_flat : int * int * int * int * int -> unit
-  = "renderer_submit_polygon_flat"
-
-external renderer_submit_polygon_shaded :
-  int * int * int * int * int * int * int -> unit
-  = "renderer_submit_polygon_shaded"
-
-external renderer_submit_polygon_flat_quad :
-  int * int * int * int * int * int -> unit
-  = "renderer_submit_polygon_flat_quad"
-
-external renderer_submit_polygon_shaded_quad :
-  int * int * int * int * int * int * int * int * int -> unit
-  = "renderer_submit_polygon_shaded_quad"
-
-external renderer_submit_draw_area_top_left : int -> unit
-  = "renderer_submit_draw_area_top_left"
-
-external renderer_submit_draw_area_bottom_right : int -> unit
-  = "renderer_submit_draw_area_bottom_right"
-
-external renderer_submit_draw_mode : int -> unit = "renderer_submit_draw_mode"
-
-let renderer_submit (cmd : renderer_command_name) (a0 : int) (a1 : int)
-    (a2 : int) (a3 : int) : unit =
-  renderer_submit_named (renderer_command_name_to_string cmd) a0 a1 a2 a3
+let renderer_submit = Renderer.submit
 
 type gp0_command =
   | Gp0Unknown
@@ -279,7 +223,7 @@ let gp0_begin_image_load (gpu : gpu) (arg0 : int) (arg1 : int) : unit =
     gpu.gp0.image_words_remaining <- (total_pixels + 1) / 2;
     gpu.gp0.image_wh <- arg1;
     gpu.gp0.image_load_active <- gpu.gp0.image_words_remaining > 0;
-    renderer_submit CmdImageBegin arg0 arg1 0 0
+    renderer_submit (Renderer.ImageBegin (arg0, arg1))
 
 let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
     =
@@ -290,14 +234,14 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
   | 0x1F -> gpu.irq <- true
   | 0xE1 ->
       gpu.draw_mode <- first_word land 0x7FF;
-      renderer_submit_draw_mode gpu.draw_mode
+      renderer_submit (Renderer.DrawMode gpu.draw_mode)
   | 0xE2 -> gpu.texture_window <- first_word land 0xFFFFF
   | 0xE3 ->
       gpu.drawing_area_tl <- first_word land 0x000FFFFF;
-      renderer_submit_draw_area_top_left gpu.drawing_area_tl
+      renderer_submit (Renderer.DrawAreaTopLeft gpu.drawing_area_tl)
   | 0xE4 ->
       gpu.drawing_area_br <- first_word land 0x000FFFFF;
-      renderer_submit_draw_area_bottom_right gpu.drawing_area_br
+      renderer_submit (Renderer.DrawAreaBottomRight gpu.drawing_area_br)
   | 0xE5 -> gpu.drawing_offset <- first_word land 0x003FFFFF
   | 0xE6 -> gpu.mask_bit_setting <- first_word land 0x3
   | _ -> (
@@ -306,88 +250,108 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
         if gp0_polygon_is_shaded opcode then
           match (gp0_polygon_is_quad opcode, args) with
           | false, [ arg0; arg1; arg2; arg3; arg4 ] ->
-              renderer_submit_polygon_shaded
-                ( semi,
-                  gp0_decode_color555 first_word,
-                  arg0,
-                  gp0_decode_color555 arg1,
-                  arg2,
-                  gp0_decode_color555 arg3,
-                  arg4 )
+              renderer_submit
+                (Renderer.PolygonShadedTri
+                   ( semi <> 0,
+                     gp0_decode_color555 first_word,
+                     arg0,
+                     gp0_decode_color555 arg1,
+                     arg2,
+                     gp0_decode_color555 arg3,
+                     arg4 ))
           | true, [ arg0; arg1; arg2; arg3; arg4; arg5; arg6 ] ->
-              renderer_submit_polygon_shaded_quad
-                ( semi,
-                  gp0_decode_color555 first_word,
-                  arg0,
-                  gp0_decode_color555 arg1,
-                  arg2,
-                  gp0_decode_color555 arg3,
-                  arg4,
-                  gp0_decode_color555 arg5,
-                  arg6 )
+              renderer_submit
+                (Renderer.PolygonShadedQuad
+                   ( semi <> 0,
+                     gp0_decode_color555 first_word,
+                     arg0,
+                     gp0_decode_color555 arg1,
+                     arg2,
+                     gp0_decode_color555 arg3,
+                     arg4,
+                     gp0_decode_color555 arg5,
+                     arg6 ))
           | _ -> ()
         else
           match (gp0_polygon_is_quad opcode, args) with
           | false, [ arg0; arg1; arg2 ] ->
-              renderer_submit_polygon_flat
-                (semi, gp0_decode_color555 first_word, arg0, arg1, arg2)
+              renderer_submit
+                (Renderer.PolygonFlatTri
+                   (semi <> 0, gp0_decode_color555 first_word, arg0, arg1, arg2))
           | true, [ arg0; arg1; arg2; arg3 ] ->
-              renderer_submit_polygon_flat_quad
-                (semi, gp0_decode_color555 first_word, arg0, arg1, arg2, arg3)
+              renderer_submit
+                (Renderer.PolygonFlatQuad
+                   ( semi <> 0,
+                     gp0_decode_color555 first_word,
+                     arg0,
+                     arg1,
+                     arg2,
+                     arg3 ))
           | _ -> ()
       else
         match (gp0_decode_command opcode, args) with
         | Gp0FillVram, [ arg0; arg1 ] ->
-            renderer_submit CmdFill (first_word land 0x00FFFFFF) arg0 arg1 0
+            renderer_submit
+              (Renderer.Fill (first_word land 0x00FFFFFF, arg0, arg1))
         | Gp0CpuToVram, [ arg0; arg1 ] -> gp0_begin_image_load gpu arg0 arg1
         | Gp0VramToVram, [ src_xy; dst_xy; wh ] ->
-            renderer_submit CmdVramCopy src_xy dst_xy wh 0
+            renderer_submit (Renderer.VramCopy (src_xy, dst_xy, wh))
         | Gp0RectVar, [ arg0; arg1 ] ->
-            renderer_submit CmdRect
-              (if opcode land 0x02 <> 0 then 1 else 0)
-              (first_word land 0x00FFFFFF)
-              arg0 arg1
+            renderer_submit
+              (Renderer.Rect
+                 (opcode land 0x02 <> 0, first_word land 0x00FFFFFF, arg0, arg1))
         | Gp0RectDot, [ arg0 ] ->
-            renderer_submit CmdRect
-              (if opcode land 0x02 <> 0 then 1 else 0)
-              (first_word land 0x00FFFFFF)
-              arg0
-              ((1 lsl 16) lor 1)
+            renderer_submit
+              (Renderer.Rect
+                 ( opcode land 0x02 <> 0,
+                   first_word land 0x00FFFFFF,
+                   arg0,
+                   (1 lsl 16) lor 1 ))
         | Gp0Rect8x8, [ arg0 ] ->
-            renderer_submit CmdRect
-              (if opcode land 0x02 <> 0 then 1 else 0)
-              (first_word land 0x00FFFFFF)
-              arg0
-              ((8 lsl 16) lor 8)
+            renderer_submit
+              (Renderer.Rect
+                 ( opcode land 0x02 <> 0,
+                   first_word land 0x00FFFFFF,
+                   arg0,
+                   (8 lsl 16) lor 8 ))
         | Gp0Rect16x16, [ arg0 ] ->
-            renderer_submit CmdRect
-              (if opcode land 0x02 <> 0 then 1 else 0)
-              (first_word land 0x00FFFFFF)
-              arg0
-              ((16 lsl 16) lor 16)
+            renderer_submit
+              (Renderer.Rect
+                 ( opcode land 0x02 <> 0,
+                   first_word land 0x00FFFFFF,
+                   arg0,
+                   (16 lsl 16) lor 16 ))
         | Gp0LineFlat, [ arg0; arg1 ] ->
-            renderer_submit CmdLineFlat
-              (gp0_decode_color555 first_word)
-              arg0 arg1 0
+            renderer_submit
+              (Renderer.LineFlat (gp0_decode_color555 first_word, arg0, arg1, 0))
         | Gp0LineFlatPolyline, [ arg0; arg1 ] ->
-            renderer_submit CmdLineFlat
-              (gp0_decode_color555 first_word)
-              arg0 arg1 0;
+            renderer_submit
+              (Renderer.LineFlat (gp0_decode_color555 first_word, arg0, arg1, 0));
             gpu.gp0.polyline_active <- true;
             gpu.gp0.polyline_shaded <- false;
             gpu.gp0.polyline_expect_coord <- false;
             gpu.gp0.polyline_last_color <- gp0_decode_color555 first_word;
             gpu.gp0.polyline_last_xy <- arg1
         | Gp0LineShaded, [ arg0; arg1_color; arg2 ] ->
-            renderer_submit CmdLineShaded
-              (gp0_decode_color555 first_word)
-              (gp0_decode_color555 arg1_color)
-              arg0 arg2
+            renderer_submit
+              (Renderer.LineShaded
+                 ( gp0_decode_color555 first_word,
+                   arg0,
+                   gp0_decode_color555 arg1_color,
+                   arg2,
+                   0,
+                   0,
+                   0 ))
         | Gp0LineShadedPolyline, [ arg0; arg1_color; arg2 ] ->
-            renderer_submit CmdLineShaded
-              (gp0_decode_color555 first_word)
-              (gp0_decode_color555 arg1_color)
-              arg0 arg2;
+            renderer_submit
+              (Renderer.LineShaded
+                 ( gp0_decode_color555 first_word,
+                   arg0,
+                   gp0_decode_color555 arg1_color,
+                   arg2,
+                   0,
+                   0,
+                   0 ));
             gpu.gp0.polyline_active <- true;
             gpu.gp0.polyline_shaded <- true;
             gpu.gp0.polyline_expect_coord <- false;
@@ -401,22 +365,30 @@ let process_gp0_polyline_word (gpu : gpu) (word : int) : unit =
     gpu.gp0.polyline_shaded <- false;
     gpu.gp0.polyline_expect_coord <- false)
   else if not gpu.gp0.polyline_shaded then (
-    renderer_submit CmdLineFlat gpu.gp0.polyline_last_color
-      gpu.gp0.polyline_last_xy word 0;
+    renderer_submit
+      (Renderer.LineFlat
+         (gpu.gp0.polyline_last_color, gpu.gp0.polyline_last_xy, word, 0));
     gpu.gp0.polyline_last_xy <- word)
   else if not gpu.gp0.polyline_expect_coord then (
     gpu.gp0.polyline_next_color <- gp0_decode_color555 word;
     gpu.gp0.polyline_expect_coord <- true)
   else (
-    renderer_submit CmdLineShaded gpu.gp0.polyline_last_color
-      gpu.gp0.polyline_next_color gpu.gp0.polyline_last_xy word;
+    renderer_submit
+      (Renderer.LineShaded
+         ( gpu.gp0.polyline_last_color,
+           gpu.gp0.polyline_last_xy,
+           gpu.gp0.polyline_next_color,
+           word,
+           0,
+           0,
+           0 ));
     gpu.gp0.polyline_last_xy <- word;
     gpu.gp0.polyline_last_color <- gpu.gp0.polyline_next_color;
     gpu.gp0.polyline_expect_coord <- false)
 
 let write_gp0 (gpu : gpu) (value : int) : unit =
   if gpu.gp0.image_load_active then (
-    renderer_submit CmdImageWord value 0 0 0;
+    renderer_submit (Renderer.ImageWord value);
     gpu.gp0.image_words_remaining <- gpu.gp0.image_words_remaining - 1;
     if gpu.gp0.image_words_remaining <= 0 then (
       gpu.gp0.image_words_remaining <- 0;
@@ -440,7 +412,7 @@ let write_gp1 (gpu : gpu) (value : int) : unit =
   match opcode with
   | 0x00 ->
       reset gpu;
-      renderer_submit CmdDisplayReset 0 0 0 0
+      renderer_submit Renderer.DisplayReset
   | 0x01 -> reset_gp0_state gpu
   | 0x02 -> gpu.irq <- false
   | 0x03 -> gpu.display_disabled <- value land 1 <> 0
@@ -453,16 +425,16 @@ let write_gp1 (gpu : gpu) (value : int) : unit =
         | _ -> DmaGpuReadToCpu)
   | 0x05 ->
       gpu.display_area <- value land 0x0007FFFF;
-      renderer_submit CmdDisplayArea gpu.display_area 0 0 0
+      renderer_submit (Renderer.DisplayArea gpu.display_area)
   | 0x06 ->
       gpu.display_h_range <- value land 0x000FFFFF;
-      renderer_submit CmdDisplayHRange gpu.display_h_range 0 0 0
+      renderer_submit (Renderer.DisplayHRange gpu.display_h_range)
   | 0x07 ->
       gpu.display_v_range <- value land 0x000FFFFF;
-      renderer_submit CmdDisplayVRange gpu.display_v_range 0 0 0
+      renderer_submit (Renderer.DisplayVRange gpu.display_v_range)
   | 0x08 ->
       gpu.display_mode <- value land 0xFF;
-      renderer_submit CmdDisplayMode gpu.display_mode 0 0 0
+      renderer_submit (Renderer.DisplayMode gpu.display_mode)
   | 0x10 ->
       let reg_index = value land 0x7 in
       gpu.gpuread <-

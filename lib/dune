@@ -4,7 +4,7 @@
   (language cxx)
   (names renderer)
   (flags :standard -std=c++23 -I/usr/local/include))
- (libraries ctypes ctypes-foreign)
+ (libraries ctypes ctypes-foreign threads)
  (c_library_flags
   :standard
   -L/usr/local/lib
