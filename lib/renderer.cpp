@@ -126,42 +126,6 @@ private:
   const int WIDTH = 800;
   const int HEIGHT = 600;
 
-  enum class RenderCommandType
-  {
-    Fill,
-    Rect,
-    LineFlat,
-    LineShaded,
-    PolygonFlatTri,
-    PolygonShadedTri,
-    PolygonFlatQuad,
-    PolygonShadedQuad,
-    DrawAreaTopLeft,
-    DrawAreaBottomRight,
-    DrawMode,
-    VramCopy,
-    ImageBegin,
-    ImageWord,
-    DisplayReset,
-    DisplayArea,
-    DisplayHRange,
-    DisplayVRange,
-    DisplayMode
-  };
-
-  struct RenderCommand
-  {
-    RenderCommandType type;
-    std::array<int, 10> args{};
-  };
-
-  struct QuadVertex
-  {
-    int x;
-    int y;
-    std::uint16_t color;
-  };
-
   std::atomic_bool close_requested{false};
 
   SDL_Window *window = nullptr;
@@ -219,32 +183,6 @@ private:
     {
       throw_sdl_error("failed to create VRAM texture");
     }
-  }
-
-  static std::uint16_t rgb24_to_rgb555(std::uint32_t rgb)
-  {
-    const std::uint32_t r8 = rgb & 0xFFu;
-    const std::uint32_t g8 = (rgb >> 8) & 0xFFu;
-    const std::uint32_t b8 = (rgb >> 16) & 0xFFu;
-    const std::uint16_t r5 = static_cast<std::uint16_t>((r8 * 31u + 127u) / 255u);
-    const std::uint16_t g5 = static_cast<std::uint16_t>((g8 * 31u + 127u) / 255u);
-    const std::uint16_t b5 = static_cast<std::uint16_t>((b8 * 31u + 127u) / 255u);
-    return static_cast<std::uint16_t>(r5 | (g5 << 5) | (b5 << 10));
-  }
-
-  static std::uint32_t rgb555_to_argb32(std::uint16_t p)
-  {
-    const std::uint8_t r = five_to_eight(static_cast<std::uint16_t>(p & 0x1Fu));
-    const std::uint8_t g = five_to_eight(static_cast<std::uint16_t>((p >> 5) & 0x1Fu));
-    const std::uint8_t b = five_to_eight(static_cast<std::uint16_t>((p >> 10) & 0x1Fu));
-    return 0xFF000000u | (static_cast<std::uint32_t>(r) << 16) |
-           (static_cast<std::uint32_t>(g) << 8) |
-           static_cast<std::uint32_t>(b);
-  }
-
-  static std::uint8_t five_to_eight(std::uint16_t x)
-  {
-    return static_cast<std::uint8_t>((x * 255u + 15u) / 31u);
   }
 
   void cleanup()
