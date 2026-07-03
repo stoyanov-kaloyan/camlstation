@@ -365,8 +365,9 @@ let draw_filled_quad st v0 v1 v2 v3 semi_transparent =
     semi_transparent;
   draw_filled_triangle st
     { x = v1.qx; y = v1.qy; color = v1.qcolor }
-    { x = v2.qx; y = v2.qy; color = v2.qcolor }
     { x = v3.qx; y = v3.qy; color = v3.qcolor }
+    (* Swapped v3 to be the 2nd vertex *)
+    { x = v2.qx; y = v2.qy; color = v2.qcolor }
     semi_transparent
 
 let fill_rect st x y w h color =
