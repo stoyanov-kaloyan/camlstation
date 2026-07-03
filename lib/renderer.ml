@@ -570,6 +570,23 @@ let rec render_loop st =
     Thread.delay 0.016;
     render_loop st)
 
+let save_vram_ppm filename =
+  let st = !current in
+  let oc = open_out_bin filename in
+  Printf.fprintf oc "P6\n%d %d\n255\n" vram_width vram_height;
+  for y = 0 to vram_height - 1 do
+    for x = 0 to vram_width - 1 do
+      let pixel = st.vram.((y * vram_width) + x) in
+      let r = five_to_eight (pixel land 0x1F) in
+      let g = five_to_eight ((pixel lsr 5) land 0x1F) in
+      let b = five_to_eight ((pixel lsr 10) land 0x1F) in
+      output_byte oc r;
+      output_byte oc g;
+      output_byte oc b
+    done
+  done;
+  close_out oc
+
 let init () =
   host_init ();
   let st = !current in
