@@ -591,7 +591,10 @@ let init () =
   host_init ();
   let st = !current in
   reset_state st;
-  if Option.is_none st.render_thread then
-    st.render_thread <- Some (Thread.create (fun () -> render_loop st) ())
+  ()
+
+let run () =
+  let st = !current in
+  render_loop st
 
 let submit cmd = queue_command cmd

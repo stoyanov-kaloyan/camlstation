@@ -1019,4 +1019,7 @@ let step (cpu : cpu) : unit =
   let opcode = fetch_word cpu cpu.pc in
   let instr = parse_opcode opcode in
   execute cpu instr;
-  handle_bios_call cpu
+  handle_bios_call cpu;
+  (* encountering some windows issue where the cpu is overwhelming the runtime
+  this would be removed when we have a proper timing model *)
+  if !step_count land 0x3FFF = 0 then Thread.yield ()

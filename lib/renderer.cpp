@@ -12,7 +12,6 @@
 #include <queue>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -93,10 +92,10 @@ public:
       throw_sdl_error("failed to clear renderer");
     }
 
-    const int clamped_src_x = std::clamp(src_x, 0, VRAM_WIDTH - 1);
-    const int clamped_src_y = std::clamp(src_y, 0, VRAM_HEIGHT - 1);
-    const int clamped_src_w = std::clamp(src_w, 1, VRAM_WIDTH - clamped_src_x);
-    const int clamped_src_h = std::clamp(src_h, 1, VRAM_HEIGHT - clamped_src_y);
+    const int clamped_src_x = clamp_int(src_x, 0, VRAM_WIDTH - 1);
+    const int clamped_src_y = clamp_int(src_y, 0, VRAM_HEIGHT - 1);
+    const int clamped_src_w = clamp_int(src_w, 1, VRAM_WIDTH - clamped_src_x);
+    const int clamped_src_h = clamp_int(src_h, 1, VRAM_HEIGHT - clamped_src_y);
 
     SDL_FRect src_rect{};
     src_rect.x = static_cast<float>(clamped_src_x);
@@ -133,6 +132,19 @@ private:
   SDL_Texture *vram_texture = nullptr;
   Uint32 window_id = 0;
   std::vector<std::uint32_t> upload_pixels = std::vector<std::uint32_t>(static_cast<std::size_t>(VRAM_WIDTH * VRAM_HEIGHT), 0xFF000000u);
+
+  static int clamp_int(int value, int min_value, int max_value)
+  {
+    if (value < min_value)
+    {
+      return min_value;
+    }
+    if (value > max_value)
+    {
+      return max_value;
+    }
+    return value;
+  }
 
   void throw_sdl_error(const char *message)
   {

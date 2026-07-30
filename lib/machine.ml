@@ -12,5 +12,7 @@ let run_machine () =
       loop ())
   in
   Renderer.init ();
-  loop ();
+  let cpu_thread = Thread.create loop () in
+  Renderer.run ();
+  Thread.join cpu_thread;
   Renderer.shutdown ()
