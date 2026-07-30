@@ -1,3 +1,7 @@
 {
-  "C_Cpp.default.compilerPath": "/usr/bin/g++"
+    "C_Cpp.default.compilerPath": "/usr/bin/g++",
+    "ocaml.sandbox": {
+        "kind": "opam",
+        "switch": "default"
+    }
 }

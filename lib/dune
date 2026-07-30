@@ -3,10 +3,17 @@
  (foreign_stubs
   (language cxx)
   (names renderer)
-  (flags :standard -std=c++23 -I/usr/local/include))
+  (flags :standard)
+  (include_dirs %{env:SDL3_INCLUDE_DIR=/usr/local/include}))
  (libraries threads)
  (c_library_flags
   :standard
-  -L/usr/local/lib
-  -Wl,-rpath,/usr/local/lib
-  -lSDL3))
+  -L%{env:SDL3_LIB_DIR=/usr/local/lib}
+  -lSDL3
+  -lwinmm
+  -lgdi32
+  -limm32
+  -lole32
+  -loleaut32
+  -lversion
+  -lsetupapi))
