@@ -963,7 +963,13 @@ let dump_ram cpu =
 let vblank_cycles = 50000
 
 let sideload_exe (cpu : cpu) : unit =
-  let exe_path = "./roms/RenderRectangleClip16BPP.exe" in
+  (* let exe_path = "./roms/RenderRectangleClip16BPP.exe" in *)
+  if Array.length Sys.argv < 2 then
+    failwith "Usage: camlstation <rom_file>";
+  let exe_path = Sys.argv.(1) in
+  Printf.printf "[DEBUG] Sideloading EXE from: %s\n%!" exe_path;
+  if not (Sys.file_exists exe_path) then
+    failwith (Printf.sprintf "EXE file not found: %s" exe_path);
   let exe_file = open_in_bin exe_path in
   let exe_size = in_channel_length exe_file in
   let exe_data = really_input_string exe_file exe_size in

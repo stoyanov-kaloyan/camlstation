@@ -17,6 +17,13 @@
 
 #include <SDL3/SDL.h>
 
+/*
+I am trying to keep a sane interface between OCaml and C++.
+For now I wouldn't like to use straight up bindings.
+I'm taking advantage of the fact that I'm already compiling C++ code
+and setting up a more "interesting" interface.
+*/
+
 class Renderer
 {
 public:

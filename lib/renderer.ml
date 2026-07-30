@@ -1,5 +1,6 @@
 type triangle_vertex = { x : int; y : int; color : int }
 type quad_vertex = { qx : int; qy : int; qcolor : int }
+type textured_vertex = { tx : int; ty : int; tu : int; tv : int; tcolor : int }
 
 type image_transfer_state = {
   mutable image_load_active : bool;
@@ -21,6 +22,9 @@ type command =
   | PolygonShadedTri of bool * int * int * int * int * int * int
   | PolygonFlatQuad of bool * int * int * int * int * int
   | PolygonShadedQuad of bool * int * int * int * int * int * int * int * int
+  | TexturedTri of bool * bool * int * textured_vertex * textured_vertex * textured_vertex
+  | TexturedQuad of
+      bool * bool * int * textured_vertex * textured_vertex * textured_vertex * textured_vertex
   | VramCopy of int * int * int
   | ImageBegin of int * int
   | ImageWord of int
@@ -365,10 +369,131 @@ let draw_filled_quad st v0 v1 v2 v3 semi_transparent =
     semi_transparent;
   draw_filled_triangle st
     { x = v1.qx; y = v1.qy; color = v1.qcolor }
-    { x = v3.qx; y = v3.qy; color = v3.qcolor }
-    (* Swapped v3 to be the 2nd vertex *)
     { x = v2.qx; y = v2.qy; color = v2.qcolor }
+    { x = v3.qx; y = v3.qy; color = v3.qcolor }
     semi_transparent
+
+let texture_page_origin texpage =
+  let x = (texpage land 0xF) * 64 in
+  let y = if texpage land 0x10 <> 0 then 256 else 0 in
+  let y = if texpage land 0x800 <> 0 then y + 512 else y in
+  (x, y)
+
+let sample_texture_15bit st texpage u v =
+  let page_x, page_y = texture_page_origin texpage in
+  let x = page_x + (u land 0xFF) in
+  let y = page_y + (v land 0xFF) in
+  if x >= 0 && x < vram_width && y >= 0 && y < vram_height then
+    st.vram.((y * vram_width) + x)
+  else 0
+
+let modulate_channel texel_channel color_channel =
+  let brightness = five_to_eight color_channel in
+  clamp (((texel_channel * brightness) + 64) / 128) 0 31
+
+let modulate_rgb555 texel color =
+  let tr = texel land 0x1F in
+  let tg = (texel lsr 5) land 0x1F in
+  let tb = (texel lsr 10) land 0x1F in
+  let cr = color land 0x1F in
+  let cg = (color lsr 5) land 0x1F in
+  let cb = (color lsr 10) land 0x1F in
+  modulate_channel tr cr lor (modulate_channel tg cg lsl 5)
+  lor (modulate_channel tb cb lsl 10)
+
+let draw_textured_triangle st v0 v1 v2 semi raw texpage =
+  let a = ref v0 and b = ref v1 and c = ref v2 in
+  let area =
+    ((!b.tx - !a.tx) * (!c.ty - !a.ty)) - ((!b.ty - !a.ty) * (!c.tx - !a.tx))
+  in
+  if area <> 0 then (
+    if area < 0 then (
+      let tmp = !b in
+      b := !c;
+      c := tmp);
+    let area = abs area in
+    let min_x = max 0 (max st.draw_area_left (min !a.tx (min !b.tx !c.tx))) in
+    let max_x =
+      min (vram_width - 1) (min st.draw_area_right (max !a.tx (max !b.tx !c.tx)))
+    in
+    let min_y = max 0 (max st.draw_area_top (min !a.ty (min !b.ty !c.ty))) in
+    let max_y =
+      min (vram_height - 1) (min st.draw_area_bottom (max !a.ty (max !b.ty !c.ty)))
+    in
+    let inv_area = 1.0 /. float area in
+    let edge p0 p1 px py =
+      ((p1.tx - p0.tx) * (py - p0.ty)) - ((p1.ty - p0.ty) * (px - p0.tx))
+    in
+    let is_top_left p0 p1 = p0.ty < p1.ty || (p0.ty = p1.ty && p0.tx > p1.tx) in
+    let a_r = !a.tcolor land 0x1F in
+    let a_g = (!a.tcolor lsr 5) land 0x1F in
+    let a_b = (!a.tcolor lsr 10) land 0x1F in
+    let b_r = !b.tcolor land 0x1F in
+    let b_g = (!b.tcolor lsr 5) land 0x1F in
+    let b_b = (!b.tcolor lsr 10) land 0x1F in
+    let c_r = !c.tcolor land 0x1F in
+    let c_g = (!c.tcolor lsr 5) land 0x1F in
+    let c_b = (!c.tcolor lsr 10) land 0x1F in
+    for y = min_y to max_y do
+      for x = min_x to max_x do
+        let w0 = edge !b !c x y in
+        let w1 = edge !c !a x y in
+        let w2 = edge !a !b x y in
+        let inside =
+          (w0 > 0 || (w0 = 0 && is_top_left !b !c))
+          && (w1 > 0 || (w1 = 0 && is_top_left !c !a))
+          && (w2 > 0 || (w2 = 0 && is_top_left !a !b))
+        in
+        if inside then (
+          let wa = float w0 *. inv_area in
+          let wb = float w1 *. inv_area in
+          let wc = float w2 *. inv_area in
+          let u =
+            int_of_float
+              (Float.round
+                 ((float !a.tu *. wa) +. (float !b.tu *. wb) +. (float !c.tu *. wc)))
+          in
+          let v =
+            int_of_float
+              (Float.round
+                 ((float !a.tv *. wa) +. (float !b.tv *. wb) +. (float !c.tv *. wc)))
+          in
+          let texel = sample_texture_15bit st texpage u v in
+          let texel_rgb = texel land 0x7FFF in
+          let base_color =
+            if raw then texel_rgb
+            else
+              let r =
+                int_of_float
+                  (Float.round
+                     ((float a_r *. wa) +. (float b_r *. wb) +. (float c_r *. wc)))
+              in
+              let g =
+                int_of_float
+                  (Float.round
+                     ((float a_g *. wa) +. (float b_g *. wb) +. (float c_g *. wc)))
+              in
+              let bl =
+                int_of_float
+                  (Float.round
+                     ((float a_b *. wa) +. (float b_b *. wb) +. (float c_b *. wc)))
+              in
+              modulate_rgb555 texel_rgb
+                (r land 0x1F lor ((g land 0x1F) lsl 5) lor ((bl land 0x1F) lsl 10))
+          in
+          let base_color = base_color lor (texel land 0x8000) in
+          let final_color =
+            if semi && (texel land 0x8000) <> 0 then
+              blend_rgb555 base_color st.vram.((y * vram_width) + x)
+            else base_color
+          in
+          st.vram.((y * vram_width) + x) <- final_color)
+      done
+    done)
+
+let draw_textured_quad st v0 v1 v2 v3 semi raw texpage =
+  draw_textured_triangle st v0 v1 v2 semi raw texpage;
+  draw_textured_triangle st v1 v2 v3 semi raw texpage
 
 let fill_rect st x y w h color =
   if w > 0 && h > 0 then
@@ -481,6 +606,10 @@ let process_command st = function
           qcolor = c3 land 0x7FFF;
         }
         semi
+        | TexturedTri (semi, raw, texpage, v0, v1, v2) ->
+          draw_textured_triangle st v0 v1 v2 semi raw texpage
+        | TexturedQuad (semi, raw, texpage, v0, v1, v2, v3) ->
+          draw_textured_quad st v0 v1 v2 v3 semi raw texpage
   | VramCopy (src_xy, dst_xy, wh) ->
       let src_x = src_xy land 0x3FF in
       let src_y = (src_xy lsr 16) land 0x1FF in
