@@ -172,8 +172,6 @@ let rgb24_to_rgb555 rgb =
 
 let five_to_eight x = ((x * 255) + 15) / 31
 
-let eight_to_five x = ((clamp x 0 255 * 31) + 127) / 255
-
 let rgb555_to_argb32 p =
   let r = five_to_eight (p land 0x1F) in
   let g = five_to_eight ((p lsr 5) land 0x1F) in
@@ -204,6 +202,13 @@ let dither_offset x y =
   | 2, 2 -> -4
   | 2, 3 -> 0
   | _ -> if x land 1 = 0 then 3 else -1
+
+let rgb8_to_rgb555 ?(dither = false) x y r g b =
+  let offset = if dither then dither_offset x y else 0 in
+  let r5 = clamp (r + offset) 0 255 lsr 3 in
+  let g5 = clamp (g + offset) 0 255 lsr 3 in
+  let b5 = clamp (b + offset) 0 255 lsr 3 in
+  r5 lor (g5 lsl 5) lor (b5 lsl 10)
 
 let in_draw_area x y st =
   x >= st.draw_area_left && x <= st.draw_area_right && y >= st.draw_area_top
@@ -414,6 +419,79 @@ let draw_filled_triangle st v0 v1 v2 semi_transparent =
       done
     done)
 
+let draw_shaded_triangle_24 st v0 v1 v2 semi_transparent =
+  let a = ref v0 and b = ref v1 and c = ref v2 in
+  let area =
+    ref
+      (((!b.x - !a.x) * (!c.y - !a.y))
+      - ((!b.y - !a.y) * (!c.x - !a.x)))
+  in
+  if !area <> 0 then (
+    if !area < 0 then (
+      let tmp = !b in
+      b := !c;
+      c := tmp;
+      area := - !area);
+    let min_x = max 0 (max st.draw_area_left (min !a.x (min !b.x !c.x))) in
+    let max_x =
+      min (vram_width - 1) (min st.draw_area_right (max !a.x (max !b.x !c.x)))
+    in
+    let min_y = max 0 (max st.draw_area_top (min !a.y (min !b.y !c.y))) in
+    let max_y =
+      min (vram_height - 1) (min st.draw_area_bottom (max !a.y (max !b.y !c.y)))
+    in
+    let inv_area = 1.0 /. float !area in
+    let r0 = !a.color land 0xFF
+    and g0 = (!a.color lsr 8) land 0xFF
+    and b0 = (!a.color lsr 16) land 0xFF in
+    let r1 = !b.color land 0xFF
+    and g1 = (!b.color lsr 8) land 0xFF
+    and b1 = (!b.color lsr 16) land 0xFF in
+    let r2 = !c.color land 0xFF
+    and g2 = (!c.color lsr 8) land 0xFF
+    and b2 = (!c.color lsr 16) land 0xFF in
+    let edge p0 p1 px py =
+      ((p1.x - p0.x) * (py - p0.y)) - ((p1.y - p0.y) * (px - p0.x))
+    in
+    for y = min_y to max_y do
+      for x = min_x to max_x do
+        let w0 = edge !b !c x y in
+        let w1 = edge !c !a x y in
+        let w2 = edge !a !b x y in
+        let inside =
+          (w0 > 0 || (w0 = 0 && is_top_left_edge !b !c))
+          && (w1 > 0 || (w1 = 0 && is_top_left_edge !c !a))
+          && (w2 > 0 || (w2 = 0 && is_top_left_edge !a !b))
+        in
+        if inside then
+          let wa = float w0 *. inv_area in
+          let wb = float w1 *. inv_area in
+          let wc = float w2 *. inv_area in
+          let r =
+            int_of_float
+              (Float.round
+                 ((float r0 *. wa) +. (float r1 *. wb) +. (float r2 *. wc)))
+          in
+          let g =
+            int_of_float
+              (Float.round
+                 ((float g0 *. wa) +. (float g1 *. wb) +. (float g2 *. wc)))
+          in
+          let bl =
+            int_of_float
+              (Float.round
+                 ((float b0 *. wa) +. (float b1 *. wb) +. (float b2 *. wc)))
+          in
+          let color = rgb8_to_rgb555 ~dither:st.dither_enabled x y r g bl in
+          let color =
+            if semi_transparent then
+              blend_rgb555 color st.vram.((y * vram_width) + x)
+            else color
+          in
+          st.vram.((y * vram_width) + x) <- color
+      done
+    done)
+
 let draw_filled_quad st v0 v1 v2 v3 semi_transparent =
   draw_filled_triangle st
     { x = v0.qx; y = v0.qy; color = v0.qcolor }
@@ -421,6 +499,18 @@ let draw_filled_quad st v0 v1 v2 v3 semi_transparent =
     { x = v2.qx; y = v2.qy; color = v2.qcolor }
     semi_transparent;
   draw_filled_triangle st
+    { x = v1.qx; y = v1.qy; color = v1.qcolor }
+    { x = v2.qx; y = v2.qy; color = v2.qcolor }
+    { x = v3.qx; y = v3.qy; color = v3.qcolor }
+    semi_transparent
+
+let draw_shaded_quad_24 st v0 v1 v2 v3 semi_transparent =
+  draw_shaded_triangle_24 st
+    { x = v0.qx; y = v0.qy; color = v0.qcolor }
+    { x = v1.qx; y = v1.qy; color = v1.qcolor }
+    { x = v2.qx; y = v2.qy; color = v2.qcolor }
+    semi_transparent;
+  draw_shaded_triangle_24 st
     { x = v1.qx; y = v1.qy; color = v1.qcolor }
     { x = v2.qx; y = v2.qy; color = v2.qcolor }
     { x = v3.qx; y = v3.qy; color = v3.qcolor }
@@ -460,10 +550,7 @@ let modulate_texel texel color24 =
   let cr = color24 land 0xFF in
   let cg = (color24 lsr 8) land 0xFF in
   let cb = (color24 lsr 16) land 0xFF in
-  let r = eight_to_five ((tr * cr) / 128) in
-  let g = eight_to_five ((tg * cg) / 128) in
-  let b = eight_to_five ((tb * cb) / 128) in
-  r lor (g lsl 5) lor (b lsl 10)
+  (clamp ((tr * cr) / 128) 0 255, clamp ((tg * cg) / 128) 0 255, clamp ((tb * cb) / 128) 0 255)
 
 let draw_textured_triangle st v0 v1 v2 semi_transparent raw_texture texpage clut
     =
@@ -548,19 +635,8 @@ let draw_textured_triangle st v0 v1 v2 semi_transparent raw_texture texpage clut
                       +. (float ((!b.tcolor lsr 16) land 0xFF) *. wb)
                       +. (float ((!c.tcolor lsr 16) land 0xFF) *. wc)))
                 in
-                modulate_texel texel (r lor (g lsl 8) lor (bl lsl 16))
-            in
-            let color =
-              if st.dither_enabled && not raw_texture then
-                let r = clamp ((color land 0x1F) + dither_offset x y) 0 31 in
-                let g =
-                  clamp (((color lsr 5) land 0x1F) + dither_offset x y) 0 31
-                in
-                let b =
-                  clamp (((color lsr 10) land 0x1F) + dither_offset x y) 0 31
-                in
-                r lor (g lsl 5) lor (b lsl 10)
-              else color
+                let r, g, b = modulate_texel texel (r lor (g lsl 8) lor (bl lsl 16)) in
+                rgb8_to_rgb555 ~dither:st.dither_enabled x y r g b
             in
             let idx = (y * vram_width) + x in
             st.vram.(idx) <-
@@ -638,10 +714,10 @@ let process_command st = function
       let x0, y0 = unpack_render_vertex st xy0 in
       let x1, y1 = unpack_render_vertex st xy1 in
       let x2, y2 = unpack_render_vertex st xy2 in
-      draw_filled_triangle st
-        { x = x0; y = y0; color = c0 land 0x7FFF }
-        { x = x1; y = y1; color = c1 land 0x7FFF }
-        { x = x2; y = y2; color = c2 land 0x7FFF }
+      draw_shaded_triangle_24 st
+        { x = x0; y = y0; color = c0 land 0x00FFFFFF }
+        { x = x1; y = y1; color = c1 land 0x00FFFFFF }
+        { x = x2; y = y2; color = c2 land 0x00FFFFFF }
         semi
   | PolygonFlatQuad (semi, color, xy0, xy1, xy2, xy3) ->
       let color = color land 0x7FFF in
@@ -660,11 +736,11 @@ let process_command st = function
       let x1, y1 = unpack_render_vertex st xy1 in
       let x2, y2 = unpack_render_vertex st xy2 in
       let x3, y3 = unpack_render_vertex st xy3 in
-      draw_filled_quad st
-        { qx = x0; qy = y0; qcolor = c0 land 0x7FFF }
-        { qx = x1; qy = y1; qcolor = c1 land 0x7FFF }
-        { qx = x2; qy = y2; qcolor = c2 land 0x7FFF }
-        { qx = x3; qy = y3; qcolor = c3 land 0x7FFF }
+      draw_shaded_quad_24 st
+        { qx = x0; qy = y0; qcolor = c0 land 0x00FFFFFF }
+        { qx = x1; qy = y1; qcolor = c1 land 0x00FFFFFF }
+        { qx = x2; qy = y2; qcolor = c2 land 0x00FFFFFF }
+        { qx = x3; qy = y3; qcolor = c3 land 0x00FFFFFF }
         semi
   | PolygonTexturedTri (semi, raw_texture, v0, v1, v2, clut, texpage) ->
       draw_textured_triangle st

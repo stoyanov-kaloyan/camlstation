@@ -341,23 +341,23 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
               renderer_submit
                 (Renderer.PolygonShadedTri
                    ( semi <> 0,
-                     gp0_decode_color555 first_word,
+                     gp0_color24 first_word,
                      arg0,
-                     gp0_decode_color555 arg1,
+                     gp0_color24 arg1,
                      arg2,
-                     gp0_decode_color555 arg3,
+                     gp0_color24 arg3,
                      arg4 ))
           | true, [ arg0; arg1; arg2; arg3; arg4; arg5; arg6 ] ->
               renderer_submit
                 (Renderer.PolygonShadedQuad
                    ( semi <> 0,
-                     gp0_decode_color555 first_word,
+                     gp0_color24 first_word,
                      arg0,
-                     gp0_decode_color555 arg1,
+                     gp0_color24 arg1,
                      arg2,
-                     gp0_decode_color555 arg3,
+                     gp0_color24 arg3,
                      arg4,
-                     gp0_decode_color555 arg5,
+                     gp0_color24 arg5,
                      arg6 ))
           | _ -> ()
         else
