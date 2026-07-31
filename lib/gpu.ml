@@ -126,7 +126,9 @@ let dma_direction_bits = function
 let gp0_is_polygon_command (opcode : int) : bool = opcode land 0xE0 = 0x20
 let gp0_polygon_is_shaded (opcode : int) : bool = opcode land 0x10 <> 0
 let gp0_polygon_is_quad (opcode : int) : bool = opcode land 0x08 <> 0
+let gp0_polygon_is_textured (opcode : int) : bool = opcode land 0x04 <> 0
 let gp0_polygon_is_semitransparent (opcode : int) : bool = opcode land 0x02 <> 0
+let gp0_polygon_is_raw_texture (opcode : int) : bool = opcode land 0x01 <> 0
 
 let gpustat (gpu : gpu) : int =
   let status = ref 0 in
@@ -172,10 +174,11 @@ let gp0_param_words (opcode : int) : int =
   | Gp0LineShaded | Gp0LineShadedPolyline | Gp0VramToVram -> 3
   | Gp0RectDot | Gp0Rect8x8 | Gp0Rect16x16 -> 1
   | Gp0Unknown when gp0_is_polygon_command opcode ->
+      let vertex_count = if gp0_polygon_is_quad opcode then 4 else 3 in
+      let textured_extra = if gp0_polygon_is_textured opcode then 1 else 0 in
       if gp0_polygon_is_shaded opcode then
-        if gp0_polygon_is_quad opcode then 7 else 5
-      else if gp0_polygon_is_quad opcode then 4
-      else 3
+        (1 + textured_extra) + ((vertex_count - 1) * (2 + textured_extra))
+      else vertex_count * (1 + textured_extra)
   | Gp0Unknown -> 0
 
 let gp0_decode_command (opcode : int) : gp0_command =
@@ -207,7 +210,23 @@ let gp0_decode_color555 (word : int) : int =
 let gp0_is_polygon_command (opcode : int) : bool = opcode land 0xE0 = 0x20
 let gp0_polygon_is_shaded (opcode : int) : bool = opcode land 0x10 <> 0
 let gp0_polygon_is_quad (opcode : int) : bool = opcode land 0x08 <> 0
+let gp0_polygon_is_textured (opcode : int) : bool = opcode land 0x04 <> 0
 let gp0_polygon_is_semitransparent (opcode : int) : bool = opcode land 0x02 <> 0
+let gp0_polygon_is_raw_texture (opcode : int) : bool = opcode land 0x01 <> 0
+
+let gp0_color24 (word : int) : int = word land 0x00FFFFFF
+
+let gp0_textured_vertex (xy : int) (uv : int) (color : int) :
+    Renderer.textured_vertex =
+  {
+    tx = xy land 0x7FF;
+    ty = (xy lsr 16) land 0x7FF;
+    tu = uv land 0xFF;
+    tv = (uv lsr 8) land 0xFF;
+    tcolor = color land 0x00FFFFFF;
+  }
+
+let gp0_uv_attr (uv : int) : int = (uv lsr 16) land 0xFFFF
 
 let gp0_is_polyline_terminator (word : int) : bool =
   word land 0xF000F000 = 0x50005000
@@ -235,19 +254,88 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
   | 0xE1 ->
       gpu.draw_mode <- first_word land 0x7FF;
       renderer_submit (Renderer.DrawMode gpu.draw_mode)
-  | 0xE2 -> gpu.texture_window <- first_word land 0xFFFFF
+  | 0xE2 ->
+      gpu.texture_window <- first_word land 0xFFFFF;
+      renderer_submit (Renderer.TextureWindow gpu.texture_window)
   | 0xE3 ->
       gpu.drawing_area_tl <- first_word land 0x000FFFFF;
       renderer_submit (Renderer.DrawAreaTopLeft gpu.drawing_area_tl)
   | 0xE4 ->
       gpu.drawing_area_br <- first_word land 0x000FFFFF;
       renderer_submit (Renderer.DrawAreaBottomRight gpu.drawing_area_br)
-  | 0xE5 -> gpu.drawing_offset <- first_word land 0x003FFFFF
+  | 0xE5 ->
+      gpu.drawing_offset <- first_word land 0x003FFFFF;
+      renderer_submit (Renderer.DrawOffset gpu.drawing_offset)
   | 0xE6 -> gpu.mask_bit_setting <- first_word land 0x3
   | _ -> (
       if gp0_is_polygon_command opcode then
         let semi = if gp0_polygon_is_semitransparent opcode then 1 else 0 in
-        if gp0_polygon_is_shaded opcode then
+        if gp0_polygon_is_textured opcode then
+          let raw_texture = gp0_polygon_is_raw_texture opcode in
+          if gp0_polygon_is_shaded opcode then
+            match (gp0_polygon_is_quad opcode, args) with
+            | false, [ xy0; uv0; c1; xy1; uv1; c2; xy2; uv2 ] ->
+                renderer_submit
+                  (Renderer.PolygonTexturedTri
+                     ( semi <> 0,
+                       raw_texture,
+                       gp0_textured_vertex xy0 uv0 (gp0_color24 first_word),
+                       gp0_textured_vertex xy1 uv1 (gp0_color24 c1),
+                       gp0_textured_vertex xy2 uv2 (gp0_color24 c2),
+                       gp0_uv_attr uv0,
+                       gp0_uv_attr uv1 ))
+            | ( true,
+                [
+                  xy0;
+                  uv0;
+                  c1;
+                  xy1;
+                  uv1;
+                  c2;
+                  xy2;
+                  uv2;
+                  c3;
+                  xy3;
+                  uv3;
+                ] ) ->
+                renderer_submit
+                  (Renderer.PolygonTexturedQuad
+                     ( semi <> 0,
+                       raw_texture,
+                       gp0_textured_vertex xy0 uv0 (gp0_color24 first_word),
+                       gp0_textured_vertex xy1 uv1 (gp0_color24 c1),
+                       gp0_textured_vertex xy2 uv2 (gp0_color24 c2),
+                       gp0_textured_vertex xy3 uv3 (gp0_color24 c3),
+                       gp0_uv_attr uv0,
+                       gp0_uv_attr uv1 ))
+            | _ -> ()
+          else
+            match (gp0_polygon_is_quad opcode, args) with
+            | false, [ xy0; uv0; xy1; uv1; xy2; uv2 ] ->
+                let color = gp0_color24 first_word in
+                renderer_submit
+                  (Renderer.PolygonTexturedTri
+                     ( semi <> 0,
+                       raw_texture,
+                       gp0_textured_vertex xy0 uv0 color,
+                       gp0_textured_vertex xy1 uv1 color,
+                       gp0_textured_vertex xy2 uv2 color,
+                       gp0_uv_attr uv0,
+                       gp0_uv_attr uv1 ))
+            | true, [ xy0; uv0; xy1; uv1; xy2; uv2; xy3; uv3 ] ->
+                let color = gp0_color24 first_word in
+                renderer_submit
+                  (Renderer.PolygonTexturedQuad
+                     ( semi <> 0,
+                       raw_texture,
+                       gp0_textured_vertex xy0 uv0 color,
+                       gp0_textured_vertex xy1 uv1 color,
+                       gp0_textured_vertex xy2 uv2 color,
+                       gp0_textured_vertex xy3 uv3 color,
+                       gp0_uv_attr uv0,
+                       gp0_uv_attr uv1 ))
+            | _ -> ()
+        else if gp0_polygon_is_shaded opcode then
           match (gp0_polygon_is_quad opcode, args) with
           | false, [ arg0; arg1; arg2; arg3; arg4 ] ->
               renderer_submit

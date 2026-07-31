@@ -1,5 +1,6 @@
 type triangle_vertex = { x : int; y : int; color : int }
 type quad_vertex = { qx : int; qy : int; qcolor : int }
+type textured_vertex = { tx : int; ty : int; tu : int; tv : int; tcolor : int }
 
 type image_transfer_state = {
   mutable image_load_active : bool;
@@ -21,12 +22,25 @@ type command =
   | PolygonShadedTri of bool * int * int * int * int * int * int
   | PolygonFlatQuad of bool * int * int * int * int * int
   | PolygonShadedQuad of bool * int * int * int * int * int * int * int * int
+  | PolygonTexturedTri of
+      bool * bool * textured_vertex * textured_vertex * textured_vertex * int * int
+  | PolygonTexturedQuad of
+      bool
+      * bool
+      * textured_vertex
+      * textured_vertex
+      * textured_vertex
+      * textured_vertex
+      * int
+      * int
   | VramCopy of int * int * int
   | ImageBegin of int * int
   | ImageWord of int
   | DisplayReset
   | DrawAreaTopLeft of int
   | DrawAreaBottomRight of int
+  | DrawOffset of int
+  | TextureWindow of int
   | DrawMode of int
   | DisplayArea of int
   | DisplayHRange of int
@@ -45,6 +59,9 @@ type state = {
   mutable draw_area_top : int;
   mutable draw_area_right : int;
   mutable draw_area_bottom : int;
+  mutable draw_offset_x : int;
+  mutable draw_offset_y : int;
+  mutable texture_window : int;
   mutable display_x : int;
   mutable display_y : int;
   mutable display_w : int;
@@ -91,6 +108,9 @@ let current =
       draw_area_top = 0;
       draw_area_right = vram_width - 1;
       draw_area_bottom = vram_height - 1;
+      draw_offset_x = 0;
+      draw_offset_y = 0;
+      texture_window = 0;
       display_x = 0;
       display_y = 0;
       display_w = 320;
@@ -107,6 +127,9 @@ let reset_state st =
   st.draw_area_top <- 0;
   st.draw_area_right <- vram_width - 1;
   st.draw_area_bottom <- vram_height - 1;
+  st.draw_offset_x <- 0;
+  st.draw_offset_y <- 0;
+  st.texture_window <- 0;
   st.display_x <- 0;
   st.display_y <- 0;
   st.display_w <- 320;
@@ -149,6 +172,8 @@ let rgb24_to_rgb555 rgb =
 
 let five_to_eight x = ((x * 255) + 15) / 31
 
+let eight_to_five x = ((clamp x 0 255 * 31) + 127) / 255
+
 let rgb555_to_argb32 p =
   let r = five_to_eight (p land 0x1F) in
   let g = five_to_eight ((p lsr 5) land 0x1F) in
@@ -183,6 +208,35 @@ let dither_offset x y =
 let in_draw_area x y st =
   x >= st.draw_area_left && x <= st.draw_area_right && y >= st.draw_area_top
   && y <= st.draw_area_bottom
+
+let sign_extend value bits =
+  let sign_bit = 1 lsl (bits - 1) in
+  if value land sign_bit = 0 then value else value - (1 lsl bits)
+
+let unpack_render_vertex st xy =
+  let x = sign_extend (xy land 0x7FF) 11 + st.draw_offset_x in
+  let y = sign_extend ((xy lsr 16) land 0x7FF) 11 + st.draw_offset_y in
+  (x, y)
+
+let offset_textured_vertex st v =
+  {
+    v with
+    tx = sign_extend v.tx 11 + st.draw_offset_x;
+    ty = sign_extend v.ty 11 + st.draw_offset_y;
+  }
+
+let apply_texture_window st u v =
+  let mask_x = st.texture_window land 0x1F in
+  let mask_y = (st.texture_window lsr 5) land 0x1F in
+  let offset_x = (st.texture_window lsr 10) land 0x1F in
+  let offset_y = (st.texture_window lsr 15) land 0x1F in
+  let windowed_u =
+    (u land lnot (mask_x lsl 3)) lor ((offset_x land mask_x) lsl 3)
+  in
+  let windowed_v =
+    (v land lnot (mask_y lsl 3)) lor ((offset_y land mask_y) lsl 3)
+  in
+  (windowed_u land 0xFF, windowed_v land 0xFF)
 
 let write_vram_pixel st x y value =
   if x >= 0 && x < vram_width && y >= 0 && y < vram_height then
@@ -278,13 +332,16 @@ let is_top_left_edge a b = a.y < b.y || (a.y = b.y && a.x > b.x)
 let draw_filled_triangle st v0 v1 v2 semi_transparent =
   let a = ref v0 and b = ref v1 and c = ref v2 in
   let area =
-    ((!b.x - !a.x) * (!c.y - !a.y)) - ((!b.y - !a.y) * (!c.x - !a.x))
+    ref
+      (((!b.x - !a.x) * (!c.y - !a.y))
+      - ((!b.y - !a.y) * (!c.x - !a.x)))
   in
-  if area <> 0 then (
-    if area < 0 then (
+  if !area <> 0 then (
+    if !area < 0 then (
       let tmp = !b in
       b := !c;
-      c := tmp);
+      c := tmp;
+      area := - !area);
     let min_x = max 0 (max st.draw_area_left (min !a.x (min !b.x !c.x))) in
     let max_x =
       min (vram_width - 1) (min st.draw_area_right (max !a.x (max !b.x !c.x)))
@@ -293,7 +350,7 @@ let draw_filled_triangle st v0 v1 v2 semi_transparent =
     let max_y =
       min (vram_height - 1) (min st.draw_area_bottom (max !a.y (max !b.y !c.y)))
     in
-    let inv_area = 1.0 /. float area in
+    let inv_area = 1.0 /. float !area in
     let r0 = !a.color land 0x1F
     and g0 = (!a.color lsr 5) land 0x1F
     and b0 = (!a.color lsr 10) land 0x1F in
@@ -365,10 +422,158 @@ let draw_filled_quad st v0 v1 v2 v3 semi_transparent =
     semi_transparent;
   draw_filled_triangle st
     { x = v1.qx; y = v1.qy; color = v1.qcolor }
-    { x = v3.qx; y = v3.qy; color = v3.qcolor }
-    (* Swapped v3 to be the 2nd vertex *)
     { x = v2.qx; y = v2.qy; color = v2.qcolor }
+    { x = v3.qx; y = v3.qy; color = v3.qcolor }
     semi_transparent
+
+let sample_texture st texpage clut u v =
+  let color_mode = (texpage lsr 7) land 0x3 in
+  let page_x = (texpage land 0xF) * 64 in
+  let page_y = ((texpage lsr 4) land 0x1) * 256 in
+  let u, v = apply_texture_window st u v in
+  let read x y =
+    if x >= 0 && x < vram_width && y >= 0 && y < vram_height then
+      st.vram.((y * vram_width) + x)
+    else 0
+  in
+  match color_mode with
+  | 0 ->
+      let packed = read (page_x + (u / 4)) (page_y + v) in
+      let palette_index = (packed lsr ((u land 0x3) * 4)) land 0xF in
+      let clut_x = (clut land 0x3F) * 16 in
+      let clut_y = (clut lsr 6) land 0x1FF in
+      read (clut_x + palette_index) clut_y
+  | 1 ->
+      let packed = read (page_x + (u / 2)) (page_y + v) in
+      let palette_index =
+        if u land 0x1 = 0 then packed land 0xFF else (packed lsr 8) land 0xFF
+      in
+      let clut_x = (clut land 0x3F) * 16 in
+      let clut_y = (clut lsr 6) land 0x1FF in
+      read (clut_x + palette_index) clut_y
+  | _ -> read (page_x + u) (page_y + v)
+
+let modulate_texel texel color24 =
+  let tr = five_to_eight (texel land 0x1F) in
+  let tg = five_to_eight ((texel lsr 5) land 0x1F) in
+  let tb = five_to_eight ((texel lsr 10) land 0x1F) in
+  let cr = color24 land 0xFF in
+  let cg = (color24 lsr 8) land 0xFF in
+  let cb = (color24 lsr 16) land 0xFF in
+  let r = eight_to_five ((tr * cr) / 128) in
+  let g = eight_to_five ((tg * cg) / 128) in
+  let b = eight_to_five ((tb * cb) / 128) in
+  r lor (g lsl 5) lor (b lsl 10)
+
+let draw_textured_triangle st v0 v1 v2 semi_transparent raw_texture texpage clut
+    =
+  let a = ref v0 and b = ref v1 and c = ref v2 in
+  let area =
+    ref
+      (((!b.tx - !a.tx) * (!c.ty - !a.ty))
+      - ((!b.ty - !a.ty) * (!c.tx - !a.tx)))
+  in
+  if !area <> 0 then (
+    if !area < 0 then (
+      let tmp = !b in
+      b := !c;
+      c := tmp;
+      area := - !area);
+    let min_x = max 0 (max st.draw_area_left (min !a.tx (min !b.tx !c.tx))) in
+    let max_x =
+      min (vram_width - 1)
+        (min st.draw_area_right (max !a.tx (max !b.tx !c.tx)))
+    in
+    let min_y = max 0 (max st.draw_area_top (min !a.ty (min !b.ty !c.ty))) in
+    let max_y =
+      min (vram_height - 1)
+        (min st.draw_area_bottom (max !a.ty (max !b.ty !c.ty)))
+    in
+    let inv_area = 1.0 /. float !area in
+    let edge p0 p1 px py =
+      ((p1.tx - p0.tx) * (py - p0.ty)) - ((p1.ty - p0.ty) * (px - p0.tx))
+    in
+    for y = min_y to max_y do
+      for x = min_x to max_x do
+        let w0 = edge !b !c x y in
+        let w1 = edge !c !a x y in
+        let w2 = edge !a !b x y in
+        let inside =
+          (w0 > 0
+          || (w0 = 0 && is_top_left_edge { x = !b.tx; y = !b.ty; color = 0 } { x = !c.tx; y = !c.ty; color = 0 }))
+          && (w1 > 0
+             || (w1 = 0 && is_top_left_edge { x = !c.tx; y = !c.ty; color = 0 } { x = !a.tx; y = !a.ty; color = 0 }))
+          && (w2 > 0
+             || (w2 = 0 && is_top_left_edge { x = !a.tx; y = !a.ty; color = 0 } { x = !b.tx; y = !b.ty; color = 0 }))
+        in
+        if inside then
+          let wa = float w0 *. inv_area in
+          let wb = float w1 *. inv_area in
+          let wc = float w2 *. inv_area in
+          let u =
+            int_of_float
+              (Float.round
+                 ((float !a.tu *. wa) +. (float !b.tu *. wb)
+                +. (float !c.tu *. wc)))
+          in
+          let v =
+            int_of_float
+              (Float.round
+                 ((float !a.tv *. wa) +. (float !b.tv *. wb)
+                +. (float !c.tv *. wc)))
+          in
+          let texel = sample_texture st texpage clut u v in
+          if texel land 0xFFFF <> 0 then (
+            let color =
+              if raw_texture then texel land 0x7FFF
+              else
+                let r =
+                  int_of_float
+                    (Float.round
+                       ((float (!a.tcolor land 0xFF) *. wa)
+                      +. (float (!b.tcolor land 0xFF) *. wb)
+                      +. (float (!c.tcolor land 0xFF) *. wc)))
+                in
+                let g =
+                  int_of_float
+                    (Float.round
+                       ((float ((!a.tcolor lsr 8) land 0xFF) *. wa)
+                      +. (float ((!b.tcolor lsr 8) land 0xFF) *. wb)
+                      +. (float ((!c.tcolor lsr 8) land 0xFF) *. wc)))
+                in
+                let bl =
+                  int_of_float
+                    (Float.round
+                       ((float ((!a.tcolor lsr 16) land 0xFF) *. wa)
+                      +. (float ((!b.tcolor lsr 16) land 0xFF) *. wb)
+                      +. (float ((!c.tcolor lsr 16) land 0xFF) *. wc)))
+                in
+                modulate_texel texel (r lor (g lsl 8) lor (bl lsl 16))
+            in
+            let color =
+              if st.dither_enabled && not raw_texture then
+                let r = clamp ((color land 0x1F) + dither_offset x y) 0 31 in
+                let g =
+                  clamp (((color lsr 5) land 0x1F) + dither_offset x y) 0 31
+                in
+                let b =
+                  clamp (((color lsr 10) land 0x1F) + dither_offset x y) 0 31
+                in
+                r lor (g lsl 5) lor (b lsl 10)
+              else color
+            in
+            let idx = (y * vram_width) + x in
+            st.vram.(idx) <-
+              if semi_transparent && texel land 0x8000 <> 0 then
+                blend_rgb555 color st.vram.(idx)
+              else color)
+      done
+    done)
+
+let draw_textured_quad st v0 v1 v2 v3 semi_transparent raw_texture texpage clut
+    =
+  draw_textured_triangle st v0 v1 v2 semi_transparent raw_texture texpage clut;
+  draw_textured_triangle st v1 v2 v3 semi_transparent raw_texture texpage clut
 
 let fill_rect st x y w h color =
   if w > 0 && h > 0 then
@@ -396,8 +601,7 @@ let process_command st = function
       fill_rect st x y w h color
   | Rect (semi, rgb, xy, wh) ->
       let color = rgb24_to_rgb555 (rgb land 0x00FFFFFF) in
-      let x = xy land 0x3FF in
-      let y = (xy lsr 16) land 0x1FF in
+      let x, y = unpack_render_vertex st xy in
       let w = wh land 0xFFFF in
       let h = (wh lsr 16) land 0xFFFF in
       if semi then
@@ -414,73 +618,68 @@ let process_command st = function
         done
       else fill_rect st x y w h color
   | LineFlat (color, xy0, xy1, _) ->
-      draw_line_flat st (xy0 land 0x3FF)
-        ((xy0 lsr 16) land 0x1FF)
-        (xy1 land 0x3FF)
-        ((xy1 lsr 16) land 0x1FF)
-        (color land 0x7FFF)
+      let x0, y0 = unpack_render_vertex st xy0 in
+      let x1, y1 = unpack_render_vertex st xy1 in
+      draw_line_flat st x0 y0 x1 y1 (color land 0x7FFF)
   | LineShaded (c0, xy0, c1, xy1, _, _, _) ->
-      draw_line_shaded st (xy0 land 0x3FF)
-        ((xy0 lsr 16) land 0x1FF)
-        (c0 land 0x7FFF) (xy1 land 0x3FF)
-        ((xy1 lsr 16) land 0x1FF)
-        (c1 land 0x7FFF)
+      let x0, y0 = unpack_render_vertex st xy0 in
+      let x1, y1 = unpack_render_vertex st xy1 in
+      draw_line_shaded st x0 y0 (c0 land 0x7FFF) x1 y1 (c1 land 0x7FFF)
   | PolygonFlatTri (semi, color, xy0, xy1, xy2) ->
       let color = color land 0x7FFF in
+      let x0, y0 = unpack_render_vertex st xy0 in
+      let x1, y1 = unpack_render_vertex st xy1 in
+      let x2, y2 = unpack_render_vertex st xy2 in
       draw_filled_triangle st
-        { x = xy0 land 0x3FF; y = (xy0 lsr 16) land 0x1FF; color }
-        { x = xy1 land 0x3FF; y = (xy1 lsr 16) land 0x1FF; color }
-        { x = xy2 land 0x3FF; y = (xy2 lsr 16) land 0x1FF; color }
-        semi
+        { x = x0; y = y0; color }
+        { x = x1; y = y1; color }
+        { x = x2; y = y2; color } semi
   | PolygonShadedTri (semi, c0, xy0, c1, xy1, c2, xy2) ->
+      let x0, y0 = unpack_render_vertex st xy0 in
+      let x1, y1 = unpack_render_vertex st xy1 in
+      let x2, y2 = unpack_render_vertex st xy2 in
       draw_filled_triangle st
-        {
-          x = xy0 land 0x3FF;
-          y = (xy0 lsr 16) land 0x1FF;
-          color = c0 land 0x7FFF;
-        }
-        {
-          x = xy1 land 0x3FF;
-          y = (xy1 lsr 16) land 0x1FF;
-          color = c1 land 0x7FFF;
-        }
-        {
-          x = xy2 land 0x3FF;
-          y = (xy2 lsr 16) land 0x1FF;
-          color = c2 land 0x7FFF;
-        }
+        { x = x0; y = y0; color = c0 land 0x7FFF }
+        { x = x1; y = y1; color = c1 land 0x7FFF }
+        { x = x2; y = y2; color = c2 land 0x7FFF }
         semi
   | PolygonFlatQuad (semi, color, xy0, xy1, xy2, xy3) ->
       let color = color land 0x7FFF in
+      let x0, y0 = unpack_render_vertex st xy0 in
+      let x1, y1 = unpack_render_vertex st xy1 in
+      let x2, y2 = unpack_render_vertex st xy2 in
+      let x3, y3 = unpack_render_vertex st xy3 in
       draw_filled_quad st
-        { qx = xy0 land 0x3FF; qy = (xy0 lsr 16) land 0x1FF; qcolor = color }
-        { qx = xy1 land 0x3FF; qy = (xy1 lsr 16) land 0x1FF; qcolor = color }
-        { qx = xy2 land 0x3FF; qy = (xy2 lsr 16) land 0x1FF; qcolor = color }
-        { qx = xy3 land 0x3FF; qy = (xy3 lsr 16) land 0x1FF; qcolor = color }
+        { qx = x0; qy = y0; qcolor = color }
+        { qx = x1; qy = y1; qcolor = color }
+        { qx = x2; qy = y2; qcolor = color }
+        { qx = x3; qy = y3; qcolor = color }
         semi
   | PolygonShadedQuad (semi, c0, xy0, c1, xy1, c2, xy2, c3, xy3) ->
+      let x0, y0 = unpack_render_vertex st xy0 in
+      let x1, y1 = unpack_render_vertex st xy1 in
+      let x2, y2 = unpack_render_vertex st xy2 in
+      let x3, y3 = unpack_render_vertex st xy3 in
       draw_filled_quad st
-        {
-          qx = xy0 land 0x3FF;
-          qy = (xy0 lsr 16) land 0x1FF;
-          qcolor = c0 land 0x7FFF;
-        }
-        {
-          qx = xy1 land 0x3FF;
-          qy = (xy1 lsr 16) land 0x1FF;
-          qcolor = c1 land 0x7FFF;
-        }
-        {
-          qx = xy2 land 0x3FF;
-          qy = (xy2 lsr 16) land 0x1FF;
-          qcolor = c2 land 0x7FFF;
-        }
-        {
-          qx = xy3 land 0x3FF;
-          qy = (xy3 lsr 16) land 0x1FF;
-          qcolor = c3 land 0x7FFF;
-        }
+        { qx = x0; qy = y0; qcolor = c0 land 0x7FFF }
+        { qx = x1; qy = y1; qcolor = c1 land 0x7FFF }
+        { qx = x2; qy = y2; qcolor = c2 land 0x7FFF }
+        { qx = x3; qy = y3; qcolor = c3 land 0x7FFF }
         semi
+  | PolygonTexturedTri (semi, raw_texture, v0, v1, v2, clut, texpage) ->
+      draw_textured_triangle st
+        (offset_textured_vertex st v0)
+        (offset_textured_vertex st v1)
+        (offset_textured_vertex st v2)
+        semi raw_texture texpage clut
+  | PolygonTexturedQuad
+      (semi, raw_texture, v0, v1, v2, v3, clut, texpage) ->
+      draw_textured_quad st
+        (offset_textured_vertex st v0)
+        (offset_textured_vertex st v1)
+        (offset_textured_vertex st v2)
+        (offset_textured_vertex st v3)
+        semi raw_texture texpage clut
   | VramCopy (src_xy, dst_xy, wh) ->
       let src_x = src_xy land 0x3FF in
       let src_y = (src_xy lsr 16) land 0x1FF in
@@ -522,6 +721,10 @@ let process_command st = function
   | DrawAreaBottomRight packed ->
       st.draw_area_right <- packed land 0x3FF;
       st.draw_area_bottom <- (packed lsr 10) land 0x3FF
+  | DrawOffset packed ->
+      st.draw_offset_x <- sign_extend (packed land 0x7FF) 11;
+      st.draw_offset_y <- sign_extend ((packed lsr 11) land 0x7FF) 11
+  | TextureWindow packed -> st.texture_window <- packed land 0xFFFFF
   | DrawMode word -> st.dither_enabled <- word land (1 lsl 9) <> 0
   | DisplayArea packed ->
       st.display_x <- packed land 0x3FF;
