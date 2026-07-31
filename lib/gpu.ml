@@ -129,6 +129,7 @@ let gp0_polygon_is_quad (opcode : int) : bool = opcode land 0x08 <> 0
 let gp0_polygon_is_textured (opcode : int) : bool = opcode land 0x04 <> 0
 let gp0_polygon_is_semitransparent (opcode : int) : bool = opcode land 0x02 <> 0
 let gp0_polygon_is_raw_texture (opcode : int) : bool = opcode land 0x01 <> 0
+let gp0_rectangle_is_textured (opcode : int) : bool = opcode land 0x04 <> 0
 
 let gpustat (gpu : gpu) : int =
   let status = ref 0 in
@@ -168,11 +169,12 @@ let gp0_param_words (opcode : int) : int =
     else if opcode land 0xF8 = 0x58 then Gp0LineShadedPolyline
     else Gp0Unknown
   with
-  | Gp0FillVram | Gp0CpuToVram | Gp0RectVar | Gp0LineFlat | Gp0LineFlatPolyline
-    ->
+  | Gp0FillVram | Gp0CpuToVram | Gp0LineFlat | Gp0LineFlatPolyline ->
       2
+  | Gp0RectVar -> if gp0_rectangle_is_textured opcode then 3 else 2
   | Gp0LineShaded | Gp0LineShadedPolyline | Gp0VramToVram -> 3
-  | Gp0RectDot | Gp0Rect8x8 | Gp0Rect16x16 -> 1
+  | Gp0RectDot | Gp0Rect8x8 | Gp0Rect16x16 ->
+      if gp0_rectangle_is_textured opcode then 2 else 1
   | Gp0Unknown when gp0_is_polygon_command opcode ->
       let vertex_count = if gp0_polygon_is_quad opcode then 4 else 3 in
       let textured_extra = if gp0_polygon_is_textured opcode then 1 else 0 in
@@ -252,7 +254,7 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
   | 0x01 -> ()
   | 0x1F -> gpu.irq <- true
   | 0xE1 ->
-      gpu.draw_mode <- first_word land 0x7FF;
+      gpu.draw_mode <- first_word land 0x3FFF;
       renderer_submit (Renderer.DrawMode gpu.draw_mode)
   | 0xE2 ->
       gpu.texture_window <- first_word land 0xFFFFF;
@@ -384,10 +386,37 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
         | Gp0CpuToVram, [ arg0; arg1 ] -> gp0_begin_image_load gpu arg0 arg1
         | Gp0VramToVram, [ src_xy; dst_xy; wh ] ->
             renderer_submit (Renderer.VramCopy (src_xy, dst_xy, wh))
+        | Gp0RectVar, [ xy; uv; wh ] when gp0_rectangle_is_textured opcode ->
+            renderer_submit
+              (Renderer.TexturedRect
+                 ( opcode land 0x02 <> 0,
+                   opcode land 0x01 <> 0,
+                   true,
+                   first_word land 0x00FFFFFF,
+                   xy,
+                   uv,
+                   wh ))
         | Gp0RectVar, [ arg0; arg1 ] ->
             renderer_submit
               (Renderer.Rect
                  (opcode land 0x02 <> 0, first_word land 0x00FFFFFF, arg0, arg1))
+        | (Gp0RectDot | Gp0Rect8x8 | Gp0Rect16x16), [ xy; uv ]
+          when gp0_rectangle_is_textured opcode ->
+            let size =
+              match gp0_decode_command opcode with
+              | Gp0RectDot -> 1
+              | Gp0Rect8x8 -> 8
+              | _ -> 16
+            in
+            renderer_submit
+              (Renderer.TexturedRect
+                 ( opcode land 0x02 <> 0,
+                   opcode land 0x01 <> 0,
+                   size = 16,
+                   first_word land 0x00FFFFFF,
+                   xy,
+                   uv,
+                   (size lsl 16) lor size ))
         | Gp0RectDot, [ arg0 ] ->
             renderer_submit
               (Renderer.Rect

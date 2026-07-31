@@ -16,6 +16,7 @@ type image_transfer_state = {
 type command =
   | Fill of int * int * int
   | Rect of bool * int * int * int
+  | TexturedRect of bool * bool * bool * int * int * int * int
   | LineFlat of int * int * int * int
   | LineShaded of int * int * int * int * int * int * int
   | PolygonFlatTri of bool * int * int * int * int
@@ -62,6 +63,7 @@ type state = {
   mutable draw_offset_x : int;
   mutable draw_offset_y : int;
   mutable texture_window : int;
+  mutable draw_mode : int;
   mutable display_x : int;
   mutable display_y : int;
   mutable display_w : int;
@@ -111,6 +113,7 @@ let current =
       draw_offset_x = 0;
       draw_offset_y = 0;
       texture_window = 0;
+      draw_mode = 0;
       display_x = 0;
       display_y = 0;
       display_w = 320;
@@ -130,6 +133,7 @@ let reset_state st =
   st.draw_offset_x <- 0;
   st.draw_offset_y <- 0;
   st.texture_window <- 0;
+  st.draw_mode <- 0;
   st.display_x <- 0;
   st.display_y <- 0;
   st.display_w <- 320;
@@ -186,6 +190,23 @@ let blend_rgb555 src dst =
   let dg = (dst lsr 5) land 0x1F in
   let db = (dst lsr 10) land 0x1F in
   (sr + dr) / 2 lor (((sg + dg) / 2) lsl 5) lor (((sb + db) / 2) lsl 10)
+
+let blend_rgb555_mode mode src dst =
+  let sr = src land 0x1F
+  and sg = (src lsr 5) land 0x1F
+  and sb = (src lsr 10) land 0x1F
+  and dr = dst land 0x1F
+  and dg = (dst lsr 5) land 0x1F
+  and db = (dst lsr 10) land 0x1F in
+  let blend_component s d =
+    match mode land 3 with
+    | 0 -> (s + d) / 2
+    | 1 -> min 31 (s + d)
+    | 2 -> max 0 (d - s)
+    | _ -> min 31 (d + (s / 4))
+  in
+  blend_component sr dr lor (blend_component sg dg lsl 5)
+  lor (blend_component sb db lsl 10)
 
 let dither_offset x y =
   match (y land 3, x land 3) with
@@ -516,11 +537,14 @@ let draw_shaded_quad_24 st v0 v1 v2 v3 semi_transparent =
     { x = v3.qx; y = v3.qy; color = v3.qcolor }
     semi_transparent
 
-let sample_texture st texpage clut u v =
+let sample_texture ?(use_texture_window = true) st texpage clut u v =
   let color_mode = (texpage lsr 7) land 0x3 in
   let page_x = (texpage land 0xF) * 64 in
   let page_y = ((texpage lsr 4) land 0x1) * 256 in
-  let u, v = apply_texture_window st u v in
+  let u, v =
+    if use_texture_window then apply_texture_window st u v
+    else (u land 0xFF, v land 0xFF)
+  in
   let read x y =
     if x >= 0 && x < vram_width && y >= 0 && y < vram_height then
       st.vram.((y * vram_width) + x)
@@ -651,6 +675,49 @@ let draw_textured_quad st v0 v1 v2 v3 semi_transparent raw_texture texpage clut
   draw_textured_triangle st v0 v1 v2 semi_transparent raw_texture texpage clut;
   draw_textured_triangle st v1 v2 v3 semi_transparent raw_texture texpage clut
 
+let draw_textured_rect st semi_transparent raw_texture use_texture_window color24
+    xy uv wh =
+  let x, y = unpack_render_vertex st xy in
+  let u0 = uv land 0xFF in
+  let v0 = (uv lsr 8) land 0xFF in
+  let clut = (uv lsr 16) land 0xFFFF in
+  let w = wh land 0xFFFF in
+  let h = (wh lsr 16) land 0xFFFF in
+  let flip_x = st.draw_mode land (1 lsl 12) <> 0 in
+  let flip_y = st.draw_mode land (1 lsl 13) <> 0 in
+  let blend_mode = (st.draw_mode lsr 5) land 3 in
+  if w > 0 && h > 0 then
+    let x0 = max 0 (max x st.draw_area_left) in
+    let y0 = max 0 (max y st.draw_area_top) in
+    let x1 = min (vram_width - 1) (min (x + w - 1) st.draw_area_right) in
+    let y1 = min (vram_height - 1) (min (y + h - 1) st.draw_area_bottom) in
+    for py = y0 to y1 do
+      for px = x0 to x1 do
+        let du = px - x in
+        let dv = py - y in
+        let u = if flip_x then u0 - du else u0 + du in
+        let v = if flip_y then v0 - dv else v0 + dv in
+        let texel =
+          sample_texture ~use_texture_window st st.draw_mode clut u v
+        in
+        if texel land 0xFFFF <> 0 then (
+          let color =
+            if raw_texture then texel land 0x7FFF
+            else
+              let r, g, b = modulate_texel texel color24 in
+              (* Rectangles are never dithered. *)
+              rgb8_to_rgb555 px py r g b
+          in
+          let idx = (py * vram_width) + px in
+          let color =
+            if semi_transparent && texel land 0x8000 <> 0 then
+              blend_rgb555_mode blend_mode color st.vram.(idx)
+            else color
+          in
+          st.vram.(idx) <- color lor (texel land 0x8000))
+      done
+    done
+
 let fill_rect st x y w h color =
   if w > 0 && h > 0 then
     let x0 = max 0 (max x st.draw_area_left) in
@@ -693,6 +760,9 @@ let process_command st = function
           done
         done
       else fill_rect st x y w h color
+  | TexturedRect (semi, raw_texture, use_texture_window, rgb, xy, uv, wh) ->
+      draw_textured_rect st semi raw_texture use_texture_window
+        (rgb land 0x00FFFFFF) xy uv wh
   | LineFlat (color, xy0, xy1, _) ->
       let x0, y0 = unpack_render_vertex st xy0 in
       let x1, y1 = unpack_render_vertex st xy1 in
@@ -801,7 +871,9 @@ let process_command st = function
       st.draw_offset_x <- sign_extend (packed land 0x7FF) 11;
       st.draw_offset_y <- sign_extend ((packed lsr 11) land 0x7FF) 11
   | TextureWindow packed -> st.texture_window <- packed land 0xFFFFF
-  | DrawMode word -> st.dither_enabled <- word land (1 lsl 9) <> 0
+  | DrawMode word ->
+      st.draw_mode <- word land 0x3FFF;
+      st.dither_enabled <- word land (1 lsl 9) <> 0
   | DisplayArea packed ->
       st.display_x <- packed land 0x3FF;
       st.display_y <- (packed lsr 10) land 0x1FF

@@ -6,7 +6,9 @@
  (link_flags -linkall))
 
 (rule
- (enabled_if (= %{ocaml-config:system} win64))
+ (enabled_if
+  (= %{ocaml-config:system} win64))
  (targets SDL3.dll)
  (deps %{env:SDL3_LIB_DIR=C:/deps/sdl3/lib/x64}/SDL3.dll)
- (action (copy %{deps} %{targets})))
+ (action
+  (copy %{deps} %{targets})))
