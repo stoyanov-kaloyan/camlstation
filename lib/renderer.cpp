@@ -72,12 +72,25 @@ public:
       caml_invalid_argument("renderer_present_frame: unexpected pixel buffer size");
     }
 
-    for (std::size_t i = 0; i < total_pixels; ++i)
+    const int clamped_src_x = clamp_int(src_x, 0, VRAM_WIDTH - 1);
+    const int clamped_src_y = clamp_int(src_y, 0, VRAM_HEIGHT - 1);
+    const int clamped_src_w = clamp_int(src_w, 1, VRAM_WIDTH - clamped_src_x);
+    const int clamped_src_h = clamp_int(src_h, 1, VRAM_HEIGHT - clamped_src_y);
+
+    for (int y = clamped_src_y; y < clamped_src_y + clamped_src_h; ++y)
     {
-      upload_pixels[i] = static_cast<std::uint32_t>(Long_val(Field(pixels, static_cast<long>(i))));
+      const std::size_t row = static_cast<std::size_t>(y * VRAM_WIDTH);
+      for (int x = clamped_src_x; x < clamped_src_x + clamped_src_w; ++x)
+      {
+        const std::size_t i = row + static_cast<std::size_t>(x);
+        upload_pixels[i] = static_cast<std::uint32_t>(Long_val(Field(pixels, static_cast<long>(i))));
+      }
     }
 
-    if (!SDL_UpdateTexture(vram_texture, nullptr, upload_pixels.data(),
+    SDL_Rect update_rect{clamped_src_x, clamped_src_y, clamped_src_w, clamped_src_h};
+    const std::uint32_t *update_start =
+        upload_pixels.data() + (clamped_src_y * VRAM_WIDTH) + clamped_src_x;
+    if (!SDL_UpdateTexture(vram_texture, &update_rect, update_start,
                            VRAM_WIDTH * static_cast<int>(sizeof(std::uint32_t))))
     {
       throw_sdl_error("failed to update VRAM texture");
@@ -98,11 +111,6 @@ public:
     {
       throw_sdl_error("failed to clear renderer");
     }
-
-    const int clamped_src_x = clamp_int(src_x, 0, VRAM_WIDTH - 1);
-    const int clamped_src_y = clamp_int(src_y, 0, VRAM_HEIGHT - 1);
-    const int clamped_src_w = clamp_int(src_w, 1, VRAM_WIDTH - clamped_src_x);
-    const int clamped_src_h = clamp_int(src_h, 1, VRAM_HEIGHT - clamped_src_y);
 
     SDL_FRect src_rect{};
     src_rect.x = static_cast<float>(clamped_src_x);
@@ -184,10 +192,10 @@ private:
 
   void create_renderer()
   {
-    renderer = SDL_CreateRenderer(window, "software");
+    renderer = SDL_CreateRenderer(window, nullptr);
     if (renderer == nullptr)
     {
-      renderer = SDL_CreateRenderer(window, nullptr);
+      renderer = SDL_CreateRenderer(window, "software");
     }
     if (renderer == nullptr)
     {

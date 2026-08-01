@@ -50,7 +50,7 @@ type command =
   | DisplayMode of int
 
 type state = {
-  mutable close_requested : bool;
+  close_requested : bool Atomic.t;
   mutable stop_requested : bool;
   vram : int array;
   upload_pixels : int array;
@@ -71,6 +71,7 @@ type state = {
   mutable display_w : int;
   mutable display_h : int;
   mutable display_24bpp : bool;
+  mutable display_refresh_hz : float;
   mutable dither_enabled : bool;
   mutable render_thread : Thread.t option;
 }
@@ -92,7 +93,7 @@ let current =
   let pixel_count = vram_width * vram_height in
   ref
     {
-      close_requested = false;
+      close_requested = Atomic.make false;
       stop_requested = false;
       vram = Array.make pixel_count 0;
       upload_pixels = Array.make pixel_count 0;
@@ -123,12 +124,13 @@ let current =
       display_w = 320;
       display_h = 240;
       display_24bpp = false;
+      display_refresh_hz = 59.826;
       dither_enabled = false;
       render_thread = None;
     }
 
 let reset_state st =
-  st.close_requested <- false;
+  Atomic.set st.close_requested false;
   st.stop_requested <- false;
   Array.fill st.vram 0 (Array.length st.vram) 0;
   st.draw_area_left <- 0;
@@ -145,6 +147,7 @@ let reset_state st =
   st.display_w <- 320;
   st.display_h <- 240;
   st.display_24bpp <- false;
+  st.display_refresh_hz <- 59.826;
   st.dither_enabled <- false;
   st.image_state.image_load_active <- false;
   st.image_state.image_x <- 0;
@@ -158,7 +161,7 @@ let reset_state st =
   Queue.clear st.queue;
   Mutex.unlock st.queue_mutex
 
-let should_close () = !current.close_requested || host_poll_close ()
+let should_close () = Atomic.get !current.close_requested || host_poll_close ()
 
 let shutdown () =
   let st = !current in
@@ -878,6 +881,7 @@ let process_command st = function
       st.display_w <- 320;
       st.display_h <- 240;
       st.display_24bpp <- false;
+      st.display_refresh_hz <- 59.826;
       st.mask_bit_setting <- 0
   | DrawAreaTopLeft packed ->
       st.draw_area_left <- packed land 0x3FF;
@@ -916,7 +920,15 @@ let process_command st = function
          else if hres_lo = 2 then 512
          else 640);
       st.display_h <- (if (word lsr 2) land 0x1 <> 0 then 480 else 240);
-      st.display_24bpp <- word land (1 lsl 4) <> 0
+      st.display_24bpp <- word land (1 lsl 4) <> 0;
+      let pal = word land (1 lsl 3) <> 0 in
+      let interlaced = word land (1 lsl 5) <> 0 in
+      st.display_refresh_hz <-
+        (match (pal, interlaced) with
+        | false, true -> 59.940
+        | false, false -> 59.826
+        | true, true -> 50.000
+        | true, false -> 49.761)
 
 let vram_byte st byte_x y =
   let byte_x = byte_x mod (vram_width * 2) in
@@ -941,14 +953,21 @@ let update_upload_pixels st =
       done
     done)
   else
-    let len = Array.length st.vram in
-    for i = 0 to len - 1 do
-      st.upload_pixels.(i) <- rgb555_to_argb32 st.vram.(i)
+    let start_x = clamp st.display_x 0 (vram_width - 1) in
+    let start_y = clamp st.display_y 0 (vram_height - 1) in
+    let width = min st.display_w (vram_width - start_x) in
+    let height = min st.display_h (vram_height - start_y) in
+    for y = start_y to start_y + height - 1 do
+      let row = y * vram_width in
+      for x = start_x to start_x + width - 1 do
+        let i = row + x in
+        st.upload_pixels.(i) <- rgb555_to_argb32 st.vram.(i)
+      done
     done
 
 let pump_once st =
   host_poll_events ();
-  if host_poll_close () then st.close_requested <- true;
+  if host_poll_close () then Atomic.set st.close_requested true;
   let pending = Queue.create () in
   Mutex.lock st.queue_mutex;
   Queue.transfer st.queue pending;
@@ -963,11 +982,17 @@ let pump_once st =
     host_present st.upload_pixels st.display_x st.display_y st.display_w
       st.display_h
 
-let rec render_loop st =
-  if (not st.stop_requested) && not st.close_requested then (
+let rec render_loop st next_frame =
+  if (not st.stop_requested) && not (Atomic.get st.close_requested) then (
     pump_once st;
-    Thread.delay 0.016;
-    render_loop st)
+    let period = 1. /. st.display_refresh_hz in
+    let now = Unix.gettimeofday () in
+    let next_frame = next_frame +. period in
+    if next_frame > now then Thread.delay (next_frame -. now);
+    (* If presentation missed a deadline, drop the stale deadline instead of
+       adding a full frame delay after the work that made us late. *)
+    let next_frame = if next_frame < now -. period then now else next_frame in
+    render_loop st next_frame)
 
 let save_vram_ppm filename =
   let st = !current in
@@ -994,6 +1019,6 @@ let init () =
 
 let run () =
   let st = !current in
-  render_loop st
+  render_loop st (Unix.gettimeofday ())
 
 let submit cmd = queue_command cmd

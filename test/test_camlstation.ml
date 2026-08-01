@@ -520,6 +520,138 @@ let test_24bpp_memory_transfer () =
   if st.Renderer.display_24bpp then
     failwith "GPU reset did not restore 15BPP display scanout"
 
+let test_bios_gpustat () =
+  let gpu = Gpu.create () in
+  let reset_status = Gpu.gpustat gpu in
+  if reset_status <> 0x14802000 then
+    failf "GPUSTAT reset value: expected 14802000, got %08X" reset_status;
+
+  Gpu.write_gp1 gpu 0x03000000;
+  Gpu.write_gp1 gpu 0x08000027;
+  let display_status = Gpu.gpustat gpu in
+  if display_status land (1 lsl 23) <> 0 then
+    failwith "GPUSTAT display-disable bit remained set after GP1(03h)";
+  if display_status land (7 lsl 16) <> 6 lsl 16 then
+    failwith "GPUSTAT did not report 640-dot horizontal resolution";
+  if display_status land (1 lsl 19) = 0 then
+    failwith "GPUSTAT did not report 480-line vertical resolution";
+  if display_status land (1 lsl 22) = 0 then
+    failwith "GPUSTAT did not report interlaced display mode";
+
+  Gpu.write_gp1 gpu 0x04000002;
+  let dma_status = Gpu.gpustat gpu in
+  if dma_status land (3 lsl 29) <> 2 lsl 29 then
+    failwith "GPUSTAT did not report CPU-to-GP0 DMA direction";
+  if dma_status land (1 lsl 25) = 0 then
+    failwith "GPUSTAT did not request CPU-to-GP0 DMA";
+  Gpu.toggle_display_field gpu;
+  if Gpu.gpustat gpu land (1 lsl 31) = 0 then
+    failwith "GPUSTAT display field did not toggle";
+  gp0 gpu 0xC0000000;
+  gp0 gpu 0x00000000;
+  gp0 gpu 0x00010002;
+  if Gpu.gpustat gpu land (1 lsl 27) = 0 then
+    failwith "GPUSTAT did not report VRAM-read readiness";
+  ignore (Gpu.read_port gpu 0x1F801810);
+  if Gpu.gpustat gpu land (1 lsl 27) <> 0 then
+    failwith "GPUSTAT VRAM-read readiness did not clear after final word"
+
+let test_bios_dma_channels () =
+  let st = !Renderer.current in
+  Renderer.reset_state st;
+  let cpu = Cpu.cpu_of_bios (Array.make 4 0) in
+  let dpcr = Cpu.read_word cpu 0x1F8010F0 in
+  Cpu.write_word cpu 0x1F8010F0
+    (dpcr lor (1 lsl ((2 * 4) + 3)) lor (1 lsl ((6 * 4) + 3)));
+
+  (* DMA2 request/block mode sends an ordinary GP0 packet stream. *)
+  Cpu.write_word_array cpu.Cpu.ram 0x1000 0xA0000000;
+  Cpu.write_word_array cpu.Cpu.ram 0x1004 (xy 10 10);
+  Cpu.write_word_array cpu.Cpu.ram 0x1008 0x00010001;
+  Cpu.write_word_array cpu.Cpu.ram 0x100C 0x0000001F;
+  Cpu.write_word cpu 0x1F8010A0 0x1000;
+  Cpu.write_word cpu 0x1F8010A4 ((1 lsl 16) lor 4);
+  Cpu.write_word cpu 0x1F8010A8 0x01000201;
+  drain_renderer ();
+  assert_pixel st 10 10 0x001F;
+  if Cpu.read_word cpu 0x1F8010A8 land (1 lsl 24) <> 0 then
+    failwith "DMA2 request mode did not clear CHCR busy";
+
+  (* DMA2 linked-list mode consumes every node's payload before honoring the
+     bit-23 end marker in its next-address field. *)
+  Cpu.write_word_array cpu.Cpu.ram 0x2000 ((3 lsl 24) lor 0x2100);
+  Cpu.write_word_array cpu.Cpu.ram 0x2004 0xE3000000;
+  Cpu.write_word_array cpu.Cpu.ram 0x2008
+    (0xE4000000 lor 31 lor (31 lsl 10));
+  Cpu.write_word_array cpu.Cpu.ram 0x200C 0xE1000000;
+  Cpu.write_word_array cpu.Cpu.ram 0x2100 ((5 lsl 24) lor 0xFFFFFF);
+  Cpu.write_word_array cpu.Cpu.ram 0x2104 0x280000FF;
+  Cpu.write_word_array cpu.Cpu.ram 0x2108 (xy 20 20);
+  Cpu.write_word_array cpu.Cpu.ram 0x210C (xy 28 20);
+  Cpu.write_word_array cpu.Cpu.ram 0x2110 (xy 20 28);
+  Cpu.write_word_array cpu.Cpu.ram 0x2114 (xy 28 28);
+  Cpu.write_word cpu 0x1F8010A0 0x2000;
+  Cpu.write_word cpu 0x1F8010A8 0x01000401;
+  drain_renderer ();
+  assert_pixel st 22 22 0x001F;
+
+  (* DMA6 builds an empty ordering table backwards and terminates it with
+     the 24-bit linked-list sentinel. *)
+  Cpu.write_word cpu 0x1F8010E0 0x300C;
+  Cpu.write_word cpu 0x1F8010E4 4;
+  Cpu.write_word cpu 0x1F8010E8 0x11000002;
+  if Cpu.read_word_array cpu.Cpu.ram 0x300C <> 0x3008 then
+    failwith "OTC DMA first link is incorrect";
+  if Cpu.read_word_array cpu.Cpu.ram 0x3008 <> 0x3004 then
+    failwith "OTC DMA second link is incorrect";
+  if Cpu.read_word_array cpu.Cpu.ram 0x3004 <> 0x3000 then
+    failwith "OTC DMA third link is incorrect";
+  if Cpu.read_word_array cpu.Cpu.ram 0x3000 <> 0xFFFFFF then
+    failwith "OTC DMA end marker is incorrect";
+  if Cpu.read_word cpu 0x1F8010E8 land (1 lsl 24) <> 0 then
+    failwith "OTC DMA did not clear CHCR busy"
+
+let test_cpu_video_timing () =
+  let cpu = Cpu.cpu_of_bios (Array.make 4 0) in
+  Gpu.write_gp1 cpu.Cpu.gpu 0x08000027;
+  Cpu.advance_timing cpu 565_044;
+  if cpu.Cpu.i_stat land 1 <> 0 then
+    failwith "NTSC VBlank was raised one CPU clock too early";
+  Cpu.advance_timing cpu 1;
+  if cpu.Cpu.i_stat land 1 = 0 then
+    failwith "NTSC VBlank was not raised at the end of the field";
+  if cpu.Cpu.cycle_count <> 565_045L then
+    failwith "CPU cycle counter did not accumulate elapsed clocks";
+  if Gpu.gpustat cpu.Cpu.gpu land (1 lsl 31) = 0 then
+    failwith "VBlank did not advance the GPU display field";
+
+  cpu.Cpu.i_stat <- 0;
+  Gpu.write_gp1 cpu.Cpu.gpu 0x0800002F;
+  Cpu.advance_timing cpu 677_375;
+  if cpu.Cpu.i_stat land 1 <> 0 then
+    failwith "PAL VBlank was raised one CPU clock too early";
+  Cpu.advance_timing cpu 1;
+  if cpu.Cpu.i_stat land 1 = 0 then
+    failwith "PAL VBlank was not raised at the end of the field";
+
+  if Cpu.load_cycles cpu 0x1F800000 <> 1 then
+    failwith "scratchpad load timing is incorrect";
+  if Cpu.load_cycles cpu 0x1F801814 <> 5 then
+    failwith "on-die I/O load timing is incorrect";
+  if Cpu.load_cycles cpu 0x80001000 <> 7 then
+    failwith "main RAM load timing is incorrect";
+  if Cpu.load_cycles cpu 0xBFC00000 <> 30 then
+    failwith "BIOS ROM load timing is incorrect";
+  if Cpu.instruction_fetch_cycles cpu 0xBFC00000 <> 30 then
+    failwith "uncached BIOS instruction fetch timing is incorrect";
+  if Cpu.instruction_fetch_cycles cpu 0x80001000 <> 1 then
+    failwith "cached instruction fetch timing is incorrect";
+
+  cpu.Cpu.i_stat <- 0x9;
+  Cpu.write_word cpu 0x1F801070 0xFFFFFFF7;
+  if cpu.Cpu.i_stat <> 0x1 then
+    failwith "I_STAT zero-bit acknowledgement semantics are incorrect"
+
 let () =
   test_textured_rectangles ();
   test_texture_windows ();
@@ -528,4 +660,7 @@ let () =
   test_clut8_rectangles_and_window ();
   test_clut8_polygons_clip_dither_and_shading ();
   test_mask_bit_setting ();
-  test_24bpp_memory_transfer ()
+  test_24bpp_memory_transfer ();
+  test_bios_gpustat ();
+  test_bios_dma_channels ();
+  test_cpu_video_timing ()

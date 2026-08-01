@@ -6,6 +6,7 @@ type gp0_command =
   | Gp0Unknown
   | Gp0FillVram
   | Gp0CpuToVram
+  | Gp0VramToCpu
   | Gp0VramToVram
   | Gp0RectVar
   | Gp0RectDot
@@ -23,6 +24,8 @@ type gp0_state = {
   mutable image_load_active : bool;
   mutable image_words_remaining : int;
   mutable image_wh : int;
+  mutable image_read_active : bool;
+  mutable image_read_words_remaining : int;
   mutable polyline_active : bool;
   mutable polyline_shaded : bool;
   mutable polyline_expect_coord : bool;
@@ -46,6 +49,7 @@ type gpu = {
   mutable display_h_range : int;
   mutable display_v_range : int;
   mutable display_mode : int;
+  mutable odd_line : bool;
   gp0 : gp0_state;
 }
 
@@ -57,7 +61,7 @@ let create () =
   {
     gpuread = default_gpuread;
     irq = false;
-    display_disabled = false;
+    display_disabled = true;
     dma_direction = DmaOff;
     draw_mode = 0;
     texture_window = 0;
@@ -69,6 +73,7 @@ let create () =
     display_h_range = 0;
     display_v_range = 0;
     display_mode = 0;
+    odd_line = false;
     gp0 =
       {
         first_word = 0;
@@ -77,6 +82,8 @@ let create () =
         image_load_active = false;
         image_words_remaining = 0;
         image_wh = 0;
+        image_read_active = false;
+        image_read_words_remaining = 0;
         polyline_active = false;
         polyline_shaded = false;
         polyline_expect_coord = false;
@@ -93,6 +100,8 @@ let reset_gp0_state (gpu : gpu) : unit =
   gpu.gp0.image_load_active <- false;
   gpu.gp0.image_words_remaining <- 0;
   gpu.gp0.image_wh <- 0;
+  gpu.gp0.image_read_active <- false;
+  gpu.gp0.image_read_words_remaining <- 0;
   gpu.gp0.polyline_active <- false;
   gpu.gp0.polyline_shaded <- false;
   gpu.gp0.polyline_expect_coord <- false;
@@ -103,7 +112,7 @@ let reset_gp0_state (gpu : gpu) : unit =
 let reset (gpu : gpu) : unit =
   gpu.gpuread <- default_gpuread;
   gpu.irq <- false;
-  gpu.display_disabled <- false;
+  gpu.display_disabled <- true;
   gpu.dma_direction <- DmaOff;
   gpu.draw_mode <- 0;
   gpu.texture_window <- 0;
@@ -115,7 +124,11 @@ let reset (gpu : gpu) : unit =
   gpu.display_h_range <- 0;
   gpu.display_v_range <- 0;
   gpu.display_mode <- 0;
+  gpu.odd_line <- false;
   reset_gp0_state gpu
+
+let toggle_display_field (gpu : gpu) : unit =
+  gpu.odd_line <- not gpu.odd_line
 
 let dma_direction_bits = function
   | DmaOff -> 0
@@ -140,19 +153,51 @@ let gpustat (gpu : gpu) : int =
   (* GP0(E6) mask controls are reflected in GPUSTAT bits 11 and 12. *)
   status := !status lor ((gpu.mask_bit_setting land 0x3) lsl 11);
 
+  (* GPUSTAT bit 13 powers up set. It identifies the interlace field while
+     interlacing is enabled and is otherwise effectively a fixed status bit
+     on the retail GPU revisions that the BIOS targets. *)
+  status := !status lor (1 lsl 13);
+
+  (* E1 bit 11 is reported as GPUSTAT bit 15. *)
+  if gpu.draw_mode land (1 lsl 11) <> 0 then
+    status := !status lor (1 lsl 15);
+
+  (* GP1(08h) display-mode fields are rearranged in GPUSTAT. *)
+  status := !status lor ((gpu.display_mode land 0x3) lsl 17);
+  status := !status lor (((gpu.display_mode lsr 2) land 0x1) lsl 19);
+  status := !status lor (((gpu.display_mode lsr 3) land 0x1) lsl 20);
+  status := !status lor (((gpu.display_mode lsr 4) land 0x1) lsl 21);
+  status := !status lor (((gpu.display_mode lsr 5) land 0x1) lsl 22);
+  status := !status lor (((gpu.display_mode lsr 6) land 0x1) lsl 16);
+  status := !status lor (((gpu.display_mode lsr 7) land 0x1) lsl 14);
+
   (* Display disable flag (GP1(03)). *)
   if gpu.display_disabled then status := !status lor (1 lsl 23);
 
   (* IRQ request flag. *)
   if gpu.irq then status := !status lor (1 lsl 24);
 
-  (* Command/transfer readiness: minimal model keeps GPU always ready. *)
+  (* This implementation consumes GP0 commands synchronously, so command and
+     DMA-block input are always ready. Bit 27 becomes ready after a GP0(C0h)
+     VRAM-to-CPU request; the minimal read stream currently returns zeroes. *)
   status := !status lor (1 lsl 26);
-  status := !status lor (1 lsl 27);
+  if gpu.gp0.image_read_active then status := !status lor (1 lsl 27);
   status := !status lor (1 lsl 28);
+
+  (* DMA request mirrors the relevant ready bit for the selected direction. *)
+  (match gpu.dma_direction with
+  | DmaFifo | DmaCpuToGp0 -> status := !status lor (1 lsl 25)
+  | DmaGpuReadToCpu when gpu.gp0.image_read_active ->
+      status := !status lor (1 lsl 25)
+  | DmaGpuReadToCpu -> ()
+  | DmaOff -> ());
 
   (* DMA direction selected by GP1(04). *)
   status := !status lor (dma_direction_bits gpu.dma_direction lsl 29);
+
+  (* The BIOS polls this bit to synchronize drawing with alternating display
+     fields, even when VBlank interrupts themselves time out. *)
+  if gpu.odd_line then status := !status lor (1 lsl 31);
 
   !status
 
@@ -161,6 +206,7 @@ let gp0_param_words (opcode : int) : int =
     if gp0_is_polygon_command opcode then Gp0Unknown
     else if opcode = 0x02 then Gp0FillVram
     else if opcode = 0xA0 then Gp0CpuToVram
+    else if opcode = 0xC0 then Gp0VramToCpu
     else if opcode land 0xE0 = 0x80 then Gp0VramToVram
     else if opcode land 0xF8 = 0x60 then Gp0RectVar
     else if opcode land 0xF8 = 0x68 then Gp0RectDot
@@ -172,7 +218,8 @@ let gp0_param_words (opcode : int) : int =
     else if opcode land 0xF8 = 0x58 then Gp0LineShadedPolyline
     else Gp0Unknown
   with
-  | Gp0FillVram | Gp0CpuToVram | Gp0LineFlat | Gp0LineFlatPolyline ->
+  | Gp0FillVram | Gp0CpuToVram | Gp0VramToCpu | Gp0LineFlat
+  | Gp0LineFlatPolyline ->
       2
   | Gp0RectVar -> if gp0_rectangle_is_textured opcode then 3 else 2
   | Gp0LineShaded | Gp0LineShadedPolyline | Gp0VramToVram -> 3
@@ -189,6 +236,7 @@ let gp0_param_words (opcode : int) : int =
 let gp0_decode_command (opcode : int) : gp0_command =
   if opcode = 0x02 then Gp0FillVram
   else if opcode = 0xA0 then Gp0CpuToVram
+  else if opcode = 0xC0 then Gp0VramToCpu
   else if opcode land 0xE0 = 0x80 then Gp0VramToVram
   else if opcode land 0xF8 = 0x60 then Gp0RectVar
   else if opcode land 0xF8 = 0x68 then Gp0RectDot
@@ -257,6 +305,13 @@ let gp0_begin_image_load (gpu : gpu) (arg0 : int) (arg1 : int) : unit =
     gpu.gp0.image_wh <- arg1;
     gpu.gp0.image_load_active <- gpu.gp0.image_words_remaining > 0;
     renderer_submit (Renderer.ImageBegin (arg0, arg1))
+
+let gp0_begin_image_read (gpu : gpu) (wh : int) : unit =
+  let w = wh land 0xFFFF in
+  let h = (wh lsr 16) land 0xFFFF in
+  let pixels = w * h in
+  gpu.gp0.image_read_words_remaining <- (pixels + 1) / 2;
+  gpu.gp0.image_read_active <- gpu.gp0.image_read_words_remaining > 0
 
 let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
     =
@@ -402,6 +457,7 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
             renderer_submit
               (Renderer.Fill (first_word land 0x00FFFFFF, arg0, arg1))
         | Gp0CpuToVram, [ arg0; arg1 ] -> gp0_begin_image_load gpu arg0 arg1
+        | Gp0VramToCpu, [ _src_xy; wh ] -> gp0_begin_image_read gpu wh
         | Gp0VramToVram, [ src_xy; dst_xy; wh ] ->
             renderer_submit (Renderer.VramCopy (src_xy, dst_xy, wh))
         | Gp0RectVar, [ xy; uv; wh ] when gp0_rectangle_is_textured opcode ->
@@ -584,7 +640,15 @@ let write_gp1 (gpu : gpu) (value : int) : unit =
 
 let read_port (gpu : gpu) (addr : int) : int option =
   match addr with
-  | a when a = io_gp0 -> Some gpu.gpuread
+  | a when a = io_gp0 ->
+      if gpu.gp0.image_read_active then (
+        gpu.gp0.image_read_words_remaining <-
+          gpu.gp0.image_read_words_remaining - 1;
+        if gpu.gp0.image_read_words_remaining <= 0 then (
+          gpu.gp0.image_read_words_remaining <- 0;
+          gpu.gp0.image_read_active <- false);
+        Some 0)
+      else Some gpu.gpuread
   | a when a = io_gp1 -> Some (gpustat gpu)
   | _ -> None
 

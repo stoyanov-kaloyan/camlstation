@@ -125,6 +125,12 @@ type instruction =
   | BGTZ of two
   | BLEZ of two
 
+type dma_channel = {
+  mutable base : int;
+  mutable block_control : int;
+  mutable channel_control : int;
+}
+
 type cpu = {
   mutable ram : int array;
   mutable bios : int array;
@@ -136,7 +142,12 @@ type cpu = {
   mutable cp0 : cp0;
   mutable i_stat : int;
   mutable i_mask : int;
-  mutable cycle_count : int;
+  dma_channels : dma_channel array;
+  mutable dma_control : int;
+  mutable dma_interrupt : int;
+  mutable cycle_count : int64;
+  mutable video_cycles : int64;
+  mutable hilo_ready_cycle : int64;
 }
 
 let cpu_of_bios bios =
@@ -177,7 +188,14 @@ let cpu_of_bios bios =
       };
     i_stat = 0;
     i_mask = 0;
-    cycle_count = 0;
+    dma_channels =
+      Array.init 7 (fun _ ->
+          { base = 0; block_control = 0; channel_control = 0 });
+    dma_control = 0x07654321;
+    dma_interrupt = 0;
+    cycle_count = 0L;
+    video_cycles = 0L;
+    hilo_ready_cycle = 0L;
   }
 
 (* Translate a virtual address to a physical address using the PS1's
@@ -282,6 +300,144 @@ let fetch_word (cpu : cpu) (addr : int) : int =
   else if p >= 0 && p < 0x00200000 then read_word_array cpu.ram p
   else 0
 
+let dma_register (p : int) : (int * int) option =
+  if p < 0x1F801080 || p > 0x1F8010E8 then None
+  else
+    let relative = p - 0x1F801080 in
+    let channel = relative / 0x10 in
+    let offset = relative mod 0x10 in
+    if channel < 7 && (offset = 0 || offset = 4 || offset = 8) then
+      Some (channel, offset)
+    else None
+
+let dma_irq_active (cpu : cpu) : bool =
+  let force = cpu.dma_interrupt land (1 lsl 15) <> 0 in
+  let master = cpu.dma_interrupt land (1 lsl 23) <> 0 in
+  let enabled = (cpu.dma_interrupt lsr 16) land 0x7F in
+  let flags = (cpu.dma_interrupt lsr 24) land 0x7F in
+  force || (master && enabled land flags <> 0)
+
+let dma_interrupt_value (cpu : cpu) : int =
+  (cpu.dma_interrupt land 0x7FFFFFFF)
+  lor if dma_irq_active cpu then 1 lsl 31 else 0
+
+let complete_dma (cpu : cpu) (channel_number : int) : unit =
+  let channel = cpu.dma_channels.(channel_number) in
+  channel.channel_control <-
+    channel.channel_control land lnot ((1 lsl 24) lor (1 lsl 28));
+  cpu.dma_interrupt <-
+    cpu.dma_interrupt lor (1 lsl (24 + channel_number));
+  if dma_irq_active cpu then cpu.i_stat <- cpu.i_stat lor (1 lsl 3)
+
+let dma_count_field value =
+  let count = value land 0xFFFF in
+  if count = 0 then 0x10000 else count
+
+let run_gpu_linked_list_dma (cpu : cpu) (channel : dma_channel) : unit =
+  let address = ref (channel.base land 0x1FFFFC) in
+  let finished = ref false in
+  let nodes = ref 0 in
+  (* Malformed lists must not be able to hang the emulator host forever. *)
+  let max_nodes = Array.length cpu.ram / 4 in
+  while not !finished && !nodes < max_nodes do
+    incr nodes;
+    let header = read_word_array cpu.ram !address in
+    let data_words = (header lsr 24) land 0xFF in
+    for i = 1 to data_words do
+      let data_address = (!address + (i * 4)) land 0x1FFFFC in
+      Gpu.write_gp0 cpu.gpu (read_word_array cpu.ram data_address)
+    done;
+    let next_address = header land 0xFFFFFF in
+    if next_address land 0x800000 <> 0 then finished := true
+    else address := next_address land 0x1FFFFC
+  done
+
+let run_gpu_block_dma (cpu : cpu) (channel : dma_channel) (sync : int) : unit =
+  let words =
+    if sync = 0 then dma_count_field channel.block_control
+    else
+      dma_count_field channel.block_control
+      * dma_count_field (channel.block_control lsr 16)
+  in
+  let address = ref (channel.base land 0x1FFFFC) in
+  let increment = if channel.channel_control land 0x2 = 0 then 4 else -4 in
+  let from_ram = channel.channel_control land 0x1 <> 0 in
+  for _ = 1 to words do
+    if from_ram then
+      Gpu.write_gp0 cpu.gpu (read_word_array cpu.ram !address)
+    else
+      (* GPU-to-RAM image reads are not needed by the BIOS splash path yet. *)
+      write_word_array cpu.ram !address 0;
+    address := (!address + increment) land 0x1FFFFC
+  done
+
+let run_otc_dma (cpu : cpu) (channel : dma_channel) : unit =
+  let words = dma_count_field channel.block_control in
+  let address = ref (channel.base land 0x1FFFFC) in
+  for i = 0 to words - 1 do
+    let header =
+      if i = words - 1 then 0xFFFFFF else (!address - 4) land 0x1FFFFF
+    in
+    write_word_array cpu.ram !address header;
+    address := (!address - 4) land 0x1FFFFC
+  done
+
+let maybe_run_dma (cpu : cpu) (channel_number : int) : unit =
+  let channel = cpu.dma_channels.(channel_number) in
+  let enabled = cpu.dma_control land (1 lsl ((channel_number * 4) + 3)) <> 0 in
+  let busy = channel.channel_control land (1 lsl 24) <> 0 in
+  let sync = (channel.channel_control lsr 9) land 0x3 in
+  let triggered =
+    sync <> 0 || channel.channel_control land (1 lsl 28) <> 0
+  in
+  if enabled && busy && triggered then (
+    (match (channel_number, sync) with
+    | 2, 2 when channel.channel_control land 0x1 <> 0 ->
+        run_gpu_linked_list_dma cpu channel
+    | 2, (0 | 1) -> run_gpu_block_dma cpu channel sync
+    | 6, 0 -> run_otc_dma cpu channel
+    | _ -> ());
+    complete_dma cpu channel_number)
+
+let read_dma_register (cpu : cpu) (p : int) : int option =
+  match dma_register p with
+  | Some (channel_number, 0) -> Some cpu.dma_channels.(channel_number).base
+  | Some (channel_number, 4) ->
+      Some cpu.dma_channels.(channel_number).block_control
+  | Some (channel_number, 8) ->
+      Some cpu.dma_channels.(channel_number).channel_control
+  | Some _ -> None
+  | None when p = 0x1F8010F0 -> Some cpu.dma_control
+  | None when p = 0x1F8010F4 -> Some (dma_interrupt_value cpu)
+  | None -> None
+
+let write_dma_register (cpu : cpu) (p : int) (value : int) : bool =
+  match dma_register p with
+  | Some (channel_number, 0) ->
+      cpu.dma_channels.(channel_number).base <- value land 0xFFFFFF;
+      true
+  | Some (channel_number, 4) ->
+      cpu.dma_channels.(channel_number).block_control <- value;
+      true
+  | Some (channel_number, 8) ->
+      cpu.dma_channels.(channel_number).channel_control <- value;
+      maybe_run_dma cpu channel_number;
+      true
+  | Some _ -> true
+  | None when p = 0x1F8010F0 ->
+      cpu.dma_control <- value;
+      for channel = 0 to 6 do
+        maybe_run_dma cpu channel
+      done;
+      true
+  | None when p = 0x1F8010F4 ->
+      let old_flags = cpu.dma_interrupt land 0x7F000000 in
+      let acknowledged = value land 0x7F000000 in
+      cpu.dma_interrupt <-
+        (value land 0x00FFFFFF) lor (old_flags land lnot acknowledged);
+      true
+  | None -> false
+
 let read_word (cpu : cpu) (addr : int) : int =
   if cache_isolated cpu then read_word_cache cpu.cache addr
   else
@@ -291,11 +447,14 @@ let read_word (cpu : cpu) (addr : int) : int =
     | Scratchpad offset -> read_word_array cpu.scratchpad offset
     | RAM offset -> read_word_array cpu.ram offset
     | IO ->
-        if p = 0x1F801810 || p = 0x1F801814 then
-          Option.value ~default:0 (Gpu.read_port cpu.gpu p)
-        else if p = 0x1F801070 then cpu.i_stat
-        else if p = 0x1F801074 then cpu.i_mask
-        else 0
+        (match read_dma_register cpu p with
+        | Some value -> value
+        | None ->
+            if p = 0x1F801810 || p = 0x1F801814 then
+              Option.value ~default:0 (Gpu.read_port cpu.gpu p)
+            else if p = 0x1F801070 then cpu.i_stat
+            else if p = 0x1F801074 then cpu.i_mask
+            else 0)
     | Invalid -> 0
 
 let write_word (cpu : cpu) (addr : int) (value : int) : unit =
@@ -307,9 +466,12 @@ let write_word (cpu : cpu) (addr : int) (value : int) : unit =
     | Scratchpad offset -> write_word_array cpu.scratchpad offset value
     | RAM offset -> write_word_array cpu.ram offset value
     | IO ->
-        if p = 0x1F801810 then ignore (Gpu.write_port cpu.gpu p value)
+        if write_dma_register cpu p value then ()
+        else if p = 0x1F801810 then ignore (Gpu.write_port cpu.gpu p value)
         else if p = 0x1F801814 then ignore (Gpu.write_port cpu.gpu p value)
-        else if p = 0x1F801070 then cpu.i_stat <- cpu.i_stat land lnot value
+        (* I_STAT is acknowledged by writing zeroes to the bits to clear;
+           written ones leave the corresponding pending bits unchanged. *)
+        else if p = 0x1F801070 then cpu.i_stat <- cpu.i_stat land value
         else if p = 0x1F801074 then cpu.i_mask <- value land 0x7FF
     | Invalid -> ()
 
@@ -469,8 +631,40 @@ let calc_branch_target pc offset =
 
 exception CpuException of cpu_exception
 
-(* execute mutates the state *)
-let execute (cpu : cpu) (instr : instruction) : unit =
+let load_cycles (cpu : cpu) (addr : int) : int =
+  if cache_isolated cpu then 1
+  else
+    match resolve_region (phys_addr addr) with
+    | Scratchpad _ -> 1
+    | IO -> 5
+    | RAM _ -> 7
+    | BIOS _ -> 30
+    | Invalid -> 1
+
+let instruction_fetch_cycles (cpu : cpu) (addr : int) : int =
+  (* KSEG1 bypasses the 4 KiB instruction cache. KUSEG/KSEG0 fetches are
+     treated as cache hits for now; functional cache tags can refine misses
+     later without changing the scheduler's clock domain. *)
+  if addr land 0xE0000000 = 0xA0000000 then load_cycles cpu addr else 1
+
+let signed_mult_cycles value =
+  let value = to32 value in
+  if (value >= 0 && value <= 0x7FF) || (value < 0 && value >= -0x800) then 6
+  else if
+    (value >= 0 && value <= 0xFFFFF)
+    || (value < -0x800 && value >= -0x100000)
+  then 9
+  else 13
+
+let unsigned_mult_cycles value =
+  let value = value land 0xFFFFFFFF in
+  if value <= 0x7FF then 6 else if value <= 0xFFFFF then 9 else 13
+
+(* Execute one instruction and return the CPU clocks consumed.  Most cached
+   ALU instructions issue in one clock. Loads stall on the addressed bus; the
+   multiply/divide unit instead runs asynchronously until HI/LO is read. *)
+let execute (cpu : cpu) (instr : instruction) : int =
+  let cycles = ref 1 in
   let pending_load = cpu.regs.load_delay in
   cpu.regs.load_delay <- None;
 
@@ -627,15 +821,31 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     cpu.regs.lo <- ext32 lo
   in
 
+  let charge_load addr = cycles := max !cycles (load_cycles cpu addr) in
+
+  let wait_for_hilo () =
+    let remaining = Int64.sub cpu.hilo_ready_cycle cpu.cycle_count in
+    if remaining > 0L then cycles := max !cycles (Int64.to_int remaining)
+  in
+
   (* Check for pending hardware interrupts at instruction boundaries. *)
   let check_interrupts () =
-    if not in_delay_slot then
+    if not in_delay_slot then (
       let pending = cpu.i_stat land cpu.i_mask land 0x7FF in
-      if pending <> 0 && cpu.cp0.sr land 1 <> 0 then raise_exception Interrupt
+      let ip2 = 1 lsl 10 in
+      cpu.cp0.cause <-
+        (if pending <> 0 then cpu.cp0.cause lor ip2
+         else cpu.cp0.cause land lnot ip2);
+      if
+        pending <> 0
+        && cpu.cp0.sr land 1 <> 0
+        && cpu.cp0.sr land ip2 <> 0
+      then raise_exception Interrupt)
   in
   let load_word_helper rt rs imm op is_right =
+    let addr = get_reg rs + ext16 imm in
+    charge_load addr;
     if rt <> 0 then
-      let addr = get_reg rs + ext16 imm in
       let word_addr = addr land lnot 3 in
       let word = read_word cpu word_addr in
       let shift =
@@ -658,6 +868,7 @@ let execute (cpu : cpu) (instr : instruction) : unit =
 
   let store_word_helper rt rs imm op is_right =
     let addr = get_reg rs + ext16 imm in
+    charge_load addr;
     let word_addr = addr land lnot 3 in
     let mem_word = read_word cpu word_addr in
     let reg_val = get_reg rt in
@@ -684,17 +895,28 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     else write_op cpu addr (get_reg rt)
   in
 
-  try
+  (try
     check_interrupts ();
     (match instr with
     | ADD (rd, rs, rt) -> exec_rtype ( + ) ovf_add rd rs rt
     | SUB (rd, rs, rt) -> exec_rtype ( - ) ovf_sub rd rs rt
     | ADDU (rd, rs, rt) -> exec_rtype ( + ) no_ovf rd rs rt
     | SUBU (rd, rs, rt) -> exec_rtype ( - ) no_ovf rd rs rt
-    | MULT (rs, rt) -> exec_hilo mult_op rs rt
-    | MULTU (rs, rt) -> exec_hilo multu_op rs rt
-    | DIV (rs, rt) -> exec_hilo div_op rs rt
-    | DIVU (rs, rt) -> exec_hilo divu_op rs rt
+    | MULT (rs, rt) ->
+        cpu.hilo_ready_cycle <-
+          Int64.add cpu.cycle_count (Int64.of_int (signed_mult_cycles (get_reg rs)));
+        exec_hilo mult_op rs rt
+    | MULTU (rs, rt) ->
+        cpu.hilo_ready_cycle <-
+          Int64.add cpu.cycle_count
+            (Int64.of_int (unsigned_mult_cycles (get_reg rs)));
+        exec_hilo multu_op rs rt
+    | DIV (rs, rt) ->
+        cpu.hilo_ready_cycle <- Int64.add cpu.cycle_count 36L;
+        exec_hilo div_op rs rt
+    | DIVU (rs, rt) ->
+        cpu.hilo_ready_cycle <- Int64.add cpu.cycle_count 36L;
+        exec_hilo divu_op rs rt
     | AND (rd, rs, rt) -> exec_rtype ( land ) no_ovf rd rs rt
     | ADDI (rt, rs, imm) -> exec_itype ( + ) ovf_add rt rs (ext16 imm)
     | ADDIU (rt, rs, imm) -> exec_itype ( + ) no_ovf rt rs (ext16 imm)
@@ -739,27 +961,34 @@ let execute (cpu : cpu) (instr : instruction) : unit =
         set_reg rd (v asr shamt)
     | LUI (rt, imm) -> set_reg rt ((imm land 0xFFFF) lsl 16)
     | LB (rt, rs, imm) ->
+        let addr = get_reg rs + ext16 imm in
+        charge_load addr;
+        let value = read_byte cpu addr in
         if rt <> 0 then
-          let value = read_byte cpu (get_reg rs + ext16 imm) in
           cpu.regs.load_delay <- Some (rt, to32 value, get_reg rt)
     | LBU (rt, rs, imm) ->
+        let addr = get_reg rs + ext16 imm in
+        charge_load addr;
+        let value = read_byte_u cpu addr in
         if rt <> 0 then
-          let value = read_byte_u cpu (get_reg rs + ext16 imm) in
           cpu.regs.load_delay <- Some (rt, to32 value, get_reg rt)
     | LH (rt, rs, imm) ->
         let addr = get_reg rs + ext16 imm in
+        charge_load addr;
         if addr land 1 <> 0 then raise_exception (AddressErrorLoad addr)
         else if rt <> 0 then
           let value = read_halfword cpu addr in
           cpu.regs.load_delay <- Some (rt, to32 value, get_reg rt)
     | LHU (rt, rs, imm) ->
         let addr = get_reg rs + ext16 imm in
+        charge_load addr;
         if addr land 1 <> 0 then raise_exception (AddressErrorLoad addr)
         else if rt <> 0 then
           let value = read_halfword_u cpu addr in
           cpu.regs.load_delay <- Some (rt, to32 value, get_reg rt)
     | LW (rt, rs, imm) ->
         let addr = get_reg rs + ext16 imm in
+        charge_load addr;
         if addr land 3 <> 0 then raise_exception (AddressErrorLoad addr)
         else if rt <> 0 then
           let value = read_word cpu addr in
@@ -775,8 +1004,12 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     | SYSCALL -> raise_exception Syscall
     | MFC0 (rt, rd) -> set_reg rt (c0_of_reg rd)
     | MTC0 (rt, rd) -> set_c0_reg rd (get_reg rt)
-    | MFHI rd -> set_reg rd cpu.regs.hi
-    | MFLO rd -> set_reg rd cpu.regs.lo
+    | MFHI rd ->
+        wait_for_hilo ();
+        set_reg rd cpu.regs.hi
+    | MFLO rd ->
+        wait_for_hilo ();
+        set_reg rd cpu.regs.lo
     | MTHI rs -> cpu.regs.hi <- get_reg rs
     | MTLO rs -> cpu.regs.lo <- get_reg rs
     | J target ->
@@ -843,7 +1076,8 @@ let execute (cpu : cpu) (instr : instruction) : unit =
     | MOVZ (rd, rs, rt) -> if get_reg rt = 0 then set_reg rd (get_reg rs)
     | MOVN (rd, rs, rt) -> if get_reg rt <> 0 then set_reg rd (get_reg rs));
     cpu.pc <- next_pc
-  with CpuException _ -> ()
+  with CpuException _ -> ());
+  !cycles
 
 exception UnknownOpcode of int
 exception UnknownFunction of int
@@ -960,7 +1194,36 @@ let dump_ram cpu =
   done;
   close_out oc
 *)
-let vblank_cycles = 50000
+let cpu_clock_hz = 33_868_800
+
+(* Field lengths derived from the PSX CPU clock and the refresh rates documented
+   by PSX-SPX. The console has separate PAL/NTSC oscillators; using the selected
+   display standard here is the recommended emulation approximation. *)
+let video_field_cycles (gpu : Gpu.gpu) : int64 =
+  let pal = gpu.display_mode land (1 lsl 3) <> 0 in
+  let interlaced = gpu.display_mode land (1 lsl 5) <> 0 in
+  match (pal, interlaced) with
+  | false, true -> 565_045L (* 59.940 Hz *)
+  | false, false -> 566_122L (* 59.826 Hz *)
+  | true, true -> 677_376L (* 50.000 Hz *)
+  | true, false -> 680_629L (* 49.761 Hz *)
+
+let signal_vblank (cpu : cpu) : unit =
+  Gpu.toggle_display_field cpu.gpu;
+  cpu.i_stat <- cpu.i_stat lor 1
+
+let advance_timing (cpu : cpu) cycles =
+  let elapsed = Int64.of_int cycles in
+  cpu.cycle_count <- Int64.add cpu.cycle_count elapsed;
+  cpu.video_cycles <- Int64.add cpu.video_cycles elapsed;
+  let rec deliver_fields () =
+    let field_cycles = video_field_cycles cpu.gpu in
+    if cpu.video_cycles >= field_cycles then (
+      cpu.video_cycles <- Int64.sub cpu.video_cycles field_cycles;
+      signal_vblank cpu;
+      deliver_fields ())
+  in
+  deliver_fields ()
 
 let sideload_exe (cpu : cpu) : unit =
   (* let exe_path = "./roms/RenderRectangleClip16BPP.exe" in *)
@@ -1003,16 +1266,11 @@ let sideloaded = ref false
 
 let step (cpu : cpu) : unit =
   incr step_count;
-  cpu.cycle_count <- cpu.cycle_count + 1;
-  if cpu.cycle_count mod vblank_cycles = 0 && cpu.i_stat land 1 = 0 then (
-    cpu.i_stat <- cpu.i_stat lor 1;
-    (* kimi 2.7 helped me with this... could be wrong tho*)
-    (* Simulate the BIOS VBlank interrupt handler: bump the kernel VSync
-       counter.  The kernel accesses this via LUI 0x8008 + offset 0x9D9C,
-       which sign-extends to physical address 0x79D9C. *)
-    let cur = read_word_array cpu.ram 0x79D9C land 0xFFFFFFFF in
-    write_word_array cpu.ram 0x79D9C ((cur + 1) land 0xFFFFFFFF));
-  if eq32 cpu.pc 0x80030000 && not !sideloaded then (
+  if
+    eq32 cpu.pc 0x80030000
+    && not !sideloaded
+    && Array.length Sys.argv >= 2
+  then (
     sideloaded := true;
     Printf.printf
       "[DEBUG] Reached shell entry PC=0x%08X\n[DEBUG] Sideloading EXE\n%!"
@@ -1020,9 +1278,8 @@ let step (cpu : cpu) : unit =
     sideload_exe cpu);
 
   let opcode = fetch_word cpu cpu.pc in
+  let fetch_cycles = instruction_fetch_cycles cpu cpu.pc in
   let instr = parse_opcode opcode in
-  execute cpu instr;
-  handle_bios_call cpu;
-  (* encountering some windows issue where the cpu is overwhelming the runtime
-  this would be removed when we have a proper timing model *)
-  if !step_count land 0x3FFF = 0 then Thread.yield ()
+  let cycles = max fetch_cycles (execute cpu instr) in
+  advance_timing cpu cycles;
+  handle_bios_call cpu
