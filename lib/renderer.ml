@@ -70,6 +70,7 @@ type state = {
   mutable display_y : int;
   mutable display_w : int;
   mutable display_h : int;
+  mutable display_24bpp : bool;
   mutable dither_enabled : bool;
   mutable render_thread : Thread.t option;
 }
@@ -121,6 +122,7 @@ let current =
       display_y = 0;
       display_w = 320;
       display_h = 240;
+      display_24bpp = false;
       dither_enabled = false;
       render_thread = None;
     }
@@ -142,6 +144,7 @@ let reset_state st =
   st.display_y <- 0;
   st.display_w <- 320;
   st.display_h <- 240;
+  st.display_24bpp <- false;
   st.dither_enabled <- false;
   st.image_state.image_load_active <- false;
   st.image_state.image_x <- 0;
@@ -874,6 +877,7 @@ let process_command st = function
       st.display_y <- 0;
       st.display_w <- 320;
       st.display_h <- 240;
+      st.display_24bpp <- false;
       st.mask_bit_setting <- 0
   | DrawAreaTopLeft packed ->
       st.draw_area_left <- packed land 0x3FF;
@@ -911,7 +915,36 @@ let process_command st = function
          else if hres_lo = 1 then 320
          else if hres_lo = 2 then 512
          else 640);
-      st.display_h <- (if (word lsr 2) land 0x1 <> 0 then 480 else 240)
+      st.display_h <- (if (word lsr 2) land 0x1 <> 0 then 480 else 240);
+      st.display_24bpp <- word land (1 lsl 4) <> 0
+
+let vram_byte st byte_x y =
+  let byte_x = byte_x mod (vram_width * 2) in
+  let y = y mod vram_height in
+  let word = st.vram.((y * vram_width) + (byte_x / 2)) in
+  if byte_x land 1 = 0 then word land 0xFF else (word lsr 8) land 0xFF
+
+let update_upload_pixels st =
+  if st.display_24bpp then (
+    Array.fill st.upload_pixels 0 (Array.length st.upload_pixels) 0xFF000000;
+    let width = min st.display_w vram_width in
+    let height = min st.display_h vram_height in
+    let start_byte = st.display_x * 2 in
+    for y = 0 to height - 1 do
+      for x = 0 to width - 1 do
+        let pixel_byte = start_byte + (x * 3) in
+        let r = vram_byte st pixel_byte (st.display_y + y) in
+        let g = vram_byte st (pixel_byte + 1) (st.display_y + y) in
+        let b = vram_byte st (pixel_byte + 2) (st.display_y + y) in
+        st.upload_pixels.((y * vram_width) + x) <-
+          0xFF000000 lor (r lsl 16) lor (g lsl 8) lor b
+      done
+    done)
+  else
+    let len = Array.length st.vram in
+    for i = 0 to len - 1 do
+      st.upload_pixels.(i) <- rgb555_to_argb32 st.vram.(i)
+    done
 
 let pump_once st =
   host_poll_events ();
@@ -923,12 +956,12 @@ let pump_once st =
   while not (Queue.is_empty pending) do
     process_command st (Queue.pop pending)
   done;
-  let len = Array.length st.vram in
-  for i = 0 to len - 1 do
-    st.upload_pixels.(i) <- rgb555_to_argb32 st.vram.(i)
-  done;
-  host_present st.upload_pixels st.display_x st.display_y st.display_w
-    st.display_h
+  update_upload_pixels st;
+  if st.display_24bpp then
+    host_present st.upload_pixels 0 0 st.display_w st.display_h
+  else
+    host_present st.upload_pixels st.display_x st.display_y st.display_w
+      st.display_h
 
 let rec render_loop st =
   if (not st.stop_requested) && not st.close_requested then (

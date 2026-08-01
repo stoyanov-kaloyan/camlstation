@@ -7,6 +7,12 @@ let assert_pixel st x y expected =
   if actual <> expected then
     failf "pixel (%d,%d): expected %04X, got %04X" x y expected actual
 
+let assert_upload_pixel st x y expected =
+  let actual = st.Renderer.upload_pixels.((y * Renderer.vram_width) + x) in
+  if actual <> expected then
+    failf "display pixel (%d,%d): expected %08X, got %08X" x y expected
+      actual
+
 let drain_renderer () =
   let st = !Renderer.current in
   while not (Queue.is_empty st.Renderer.queue) do
@@ -456,6 +462,64 @@ let test_mask_bit_setting () =
   drain_renderer ();
   assert_pixel st 90 90 0x001F
 
+let test_24bpp_memory_transfer () =
+  let st = !Renderer.current in
+  Renderer.reset_state st;
+  let gpu = Gpu.create () in
+
+  (* Four tightly packed RGB pixels per line occupy six VRAM halfwords.
+     The second line ensures that 24BPP unpacking restarts at each 2048-byte
+     VRAM scanline rather than treating the framebuffer as one byte stream. *)
+  gp0 gpu 0xA0000000;
+  gp0 gpu (xy 0 0);
+  gp0 gpu 0x00020006;
+  gp0 gpu 0x000000FF;
+  gp0 gpu 0x000000FF;
+  gp0 gpu 0xFFFFFFFF;
+  gp0 gpu 0x0000FFFF;
+  gp0 gpu 0x00FFFFFF;
+  gp0 gpu 0x000000FF;
+
+  Gpu.write_gp1 gpu 0x08000011;
+  drain_renderer ();
+  if not st.Renderer.display_24bpp then
+    failwith "GP1(08h) did not enable 24BPP display scanout";
+  Renderer.update_upload_pixels st;
+  assert_upload_pixel st 0 0 0xFFFF0000;
+  assert_upload_pixel st 1 0 0xFF00FF00;
+  assert_upload_pixel st 2 0 0xFF0000FF;
+  assert_upload_pixel st 3 0 0xFFFFFFFF;
+  assert_upload_pixel st 0 1 0xFFFFFF00;
+  assert_upload_pixel st 1 1 0xFF00FFFF;
+  assert_upload_pixel st 2 1 0xFFFF00FF;
+  assert_upload_pixel st 3 1 0xFF000000;
+
+  (* The demo duplicates packed images with raw halfword VRAM copies. *)
+  gp0 gpu 0x80000000;
+  gp0 gpu (xy 0 0);
+  gp0 gpu (xy 6 0);
+  gp0 gpu 0x00020006;
+  Gpu.write_gp1 gpu 0x05000006;
+  drain_renderer ();
+  for y = 0 to 1 do
+    for x = 0 to 5 do
+      let src = st.Renderer.vram.((y * Renderer.vram_width) + x) in
+      let dst = st.Renderer.vram.((y * Renderer.vram_width) + 6 + x) in
+      if src <> dst then
+        failf "24BPP VRAM copy word (%d,%d): expected %04X, got %04X" x y
+          src dst
+    done
+  done;
+  Renderer.update_upload_pixels st;
+  assert_upload_pixel st 0 0 0xFFFF0000;
+  assert_upload_pixel st 1 0 0xFF00FF00;
+  assert_upload_pixel st 2 1 0xFFFF00FF;
+
+  Gpu.write_gp1 gpu 0x00000000;
+  drain_renderer ();
+  if st.Renderer.display_24bpp then
+    failwith "GPU reset did not restore 15BPP display scanout"
+
 let () =
   test_textured_rectangles ();
   test_texture_windows ();
@@ -463,4 +527,5 @@ let () =
   test_clut4_polygons_clip_and_dither ();
   test_clut8_rectangles_and_window ();
   test_clut8_polygons_clip_dither_and_shading ();
-  test_mask_bit_setting ()
+  test_mask_bit_setting ();
+  test_24bpp_memory_transfer ()
