@@ -137,6 +137,9 @@ let gpustat (gpu : gpu) : int =
   (* Draw-mode related fields in low bits. *)
   status := !status lor (gpu.draw_mode land 0x7FF);
 
+  (* GP0(E6) mask controls are reflected in GPUSTAT bits 11 and 12. *)
+  status := !status lor ((gpu.mask_bit_setting land 0x3) lsl 11);
+
   (* Display disable flag (GP1(03)). *)
   if gpu.display_disabled then status := !status lor (1 lsl 23);
 
@@ -230,6 +233,15 @@ let gp0_textured_vertex (xy : int) (uv : int) (color : int) :
 
 let gp0_uv_attr (uv : int) : int = (uv lsr 16) land 0xFFFF
 
+let gp0_apply_polygon_texpage (gpu : gpu) (uv : int) : int =
+  let texpage = gp0_uv_attr uv in
+  (* Polygon texpage attributes update E1 bits 0..8 and 11. Dither,
+     draw-to-display, and rectangle flip bits remain controlled by E1. *)
+  gpu.draw_mode <-
+    (gpu.draw_mode land lnot 0x9FF) lor (texpage land 0x9FF);
+  renderer_submit (Renderer.DrawMode gpu.draw_mode);
+  texpage
+
 let gp0_is_polyline_terminator (word : int) : bool =
   word land 0xF000F000 = 0x50005000
 
@@ -268,7 +280,9 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
   | 0xE5 ->
       gpu.drawing_offset <- first_word land 0x003FFFFF;
       renderer_submit (Renderer.DrawOffset gpu.drawing_offset)
-  | 0xE6 -> gpu.mask_bit_setting <- first_word land 0x3
+  | 0xE6 ->
+      gpu.mask_bit_setting <- first_word land 0x3;
+      renderer_submit (Renderer.MaskBitSetting gpu.mask_bit_setting)
   | _ -> (
       if gp0_is_polygon_command opcode then
         let semi = if gp0_polygon_is_semitransparent opcode then 1 else 0 in
@@ -277,6 +291,7 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
           if gp0_polygon_is_shaded opcode then
             match (gp0_polygon_is_quad opcode, args) with
             | false, [ xy0; uv0; c1; xy1; uv1; c2; xy2; uv2 ] ->
+                let texpage = gp0_apply_polygon_texpage gpu uv1 in
                 renderer_submit
                   (Renderer.PolygonTexturedTri
                      ( semi <> 0,
@@ -285,7 +300,7 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
                        gp0_textured_vertex xy1 uv1 (gp0_color24 c1),
                        gp0_textured_vertex xy2 uv2 (gp0_color24 c2),
                        gp0_uv_attr uv0,
-                       gp0_uv_attr uv1 ))
+                       texpage ))
             | ( true,
                 [
                   xy0;
@@ -300,6 +315,7 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
                   xy3;
                   uv3;
                 ] ) ->
+                let texpage = gp0_apply_polygon_texpage gpu uv1 in
                 renderer_submit
                   (Renderer.PolygonTexturedQuad
                      ( semi <> 0,
@@ -309,12 +325,13 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
                        gp0_textured_vertex xy2 uv2 (gp0_color24 c2),
                        gp0_textured_vertex xy3 uv3 (gp0_color24 c3),
                        gp0_uv_attr uv0,
-                       gp0_uv_attr uv1 ))
+                       texpage ))
             | _ -> ()
           else
             match (gp0_polygon_is_quad opcode, args) with
             | false, [ xy0; uv0; xy1; uv1; xy2; uv2 ] ->
                 let color = gp0_color24 first_word in
+                let texpage = gp0_apply_polygon_texpage gpu uv1 in
                 renderer_submit
                   (Renderer.PolygonTexturedTri
                      ( semi <> 0,
@@ -323,9 +340,10 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
                        gp0_textured_vertex xy1 uv1 color,
                        gp0_textured_vertex xy2 uv2 color,
                        gp0_uv_attr uv0,
-                       gp0_uv_attr uv1 ))
+                       texpage ))
             | true, [ xy0; uv0; xy1; uv1; xy2; uv2; xy3; uv3 ] ->
                 let color = gp0_color24 first_word in
+                let texpage = gp0_apply_polygon_texpage gpu uv1 in
                 renderer_submit
                   (Renderer.PolygonTexturedQuad
                      ( semi <> 0,
@@ -335,7 +353,7 @@ let gp0_execute_command (gpu : gpu) (first_word : int) (args : int list) : unit
                        gp0_textured_vertex xy2 uv2 color,
                        gp0_textured_vertex xy3 uv3 color,
                        gp0_uv_attr uv0,
-                       gp0_uv_attr uv1 ))
+                       texpage ))
             | _ -> ()
         else if gp0_polygon_is_shaded opcode then
           match (gp0_polygon_is_quad opcode, args) with

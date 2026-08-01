@@ -43,6 +43,7 @@ type command =
   | DrawOffset of int
   | TextureWindow of int
   | DrawMode of int
+  | MaskBitSetting of int
   | DisplayArea of int
   | DisplayHRange of int
   | DisplayVRange of int
@@ -64,6 +65,7 @@ type state = {
   mutable draw_offset_y : int;
   mutable texture_window : int;
   mutable draw_mode : int;
+  mutable mask_bit_setting : int;
   mutable display_x : int;
   mutable display_y : int;
   mutable display_w : int;
@@ -114,6 +116,7 @@ let current =
       draw_offset_y = 0;
       texture_window = 0;
       draw_mode = 0;
+      mask_bit_setting = 0;
       display_x = 0;
       display_y = 0;
       display_w = 320;
@@ -134,6 +137,7 @@ let reset_state st =
   st.draw_offset_y <- 0;
   st.texture_window <- 0;
   st.draw_mode <- 0;
+  st.mask_bit_setting <- 0;
   st.display_x <- 0;
   st.display_y <- 0;
   st.display_w <- 320;
@@ -266,7 +270,14 @@ let apply_texture_window st u v =
 
 let write_vram_pixel st x y value =
   if x >= 0 && x < vram_width && y >= 0 && y < vram_height then
-    st.vram.((y * vram_width) + x) <- value
+    let idx = (y * vram_width) + x in
+    let check_mask = st.mask_bit_setting land 0x2 <> 0 in
+    if not (check_mask && st.vram.(idx) land 0x8000 <> 0) then
+      let value =
+        if st.mask_bit_setting land 0x1 <> 0 then value lor 0x8000
+        else value
+      in
+      st.vram.(idx) <- value land 0xFFFF
 
 let begin_image_load st arg0 arg1 =
   let img = st.image_state in
@@ -436,7 +447,7 @@ let draw_filled_triangle st v0 v1 v2 semi_transparent =
               blend_rgb555 color st.vram.((y * vram_width) + x)
             else color
           in
-          st.vram.((y * vram_width) + x) <- color
+          write_vram_pixel st x y color
       done
     done)
 
@@ -509,7 +520,7 @@ let draw_shaded_triangle_24 st v0 v1 v2 semi_transparent =
               blend_rgb555 color st.vram.((y * vram_width) + x)
             else color
           in
-          st.vram.((y * vram_width) + x) <- color
+          write_vram_pixel st x y color
       done
     done)
 
@@ -663,10 +674,12 @@ let draw_textured_triangle st v0 v1 v2 semi_transparent raw_texture texpage clut
                 rgb8_to_rgb555 ~dither:st.dither_enabled x y r g b
             in
             let idx = (y * vram_width) + x in
-            st.vram.(idx) <-
+            let color =
               if semi_transparent && texel land 0x8000 <> 0 then
-                blend_rgb555 color st.vram.(idx)
-              else color)
+                blend_rgb555_mode ((texpage lsr 5) land 3) color st.vram.(idx)
+              else color
+            in
+            write_vram_pixel st x y (color lor (texel land 0x8000)))
       done
     done)
 
@@ -714,11 +727,11 @@ let draw_textured_rect st semi_transparent raw_texture use_texture_window color2
               blend_rgb555_mode blend_mode color st.vram.(idx)
             else color
           in
-          st.vram.(idx) <- color lor (texel land 0x8000))
+          write_vram_pixel st px py (color lor (texel land 0x8000)))
       done
     done
 
-let fill_rect st x y w h color =
+let fill_rect st ~masked x y w h color =
   if w > 0 && h > 0 then
     let x0 = max 0 (max x st.draw_area_left) in
     let y0 = max 0 (max y st.draw_area_top) in
@@ -727,7 +740,8 @@ let fill_rect st x y w h color =
     for py = y0 to y1 do
       let row = py * vram_width in
       for px = x0 to x1 do
-        st.vram.(row + px) <- color
+        if masked then write_vram_pixel st px py color
+        else st.vram.(row + px) <- color land 0xFFFF
       done
     done
 
@@ -741,7 +755,7 @@ let process_command st = function
         if (wh lsr 16) land 0x1FF = 0 then vram_height
         else (wh lsr 16) land 0x1FF
       in
-      fill_rect st x y w h color
+      fill_rect st ~masked:false x y w h color
   | Rect (semi, rgb, xy, wh) ->
       let color = rgb24_to_rgb555 (rgb land 0x00FFFFFF) in
       let x, y = unpack_render_vertex st xy in
@@ -756,10 +770,10 @@ let process_command st = function
           let row = py * vram_width in
           for px = x0 to x1 do
             let idx = row + px in
-            st.vram.(idx) <- blend_rgb555 color st.vram.(idx)
+            write_vram_pixel st px py (blend_rgb555 color st.vram.(idx))
           done
         done
-      else fill_rect st x y w h color
+      else fill_rect st ~masked:true x y w h color
   | TexturedRect (semi, raw_texture, use_texture_window, rgb, xy, uv, wh) ->
       draw_textured_rect st semi raw_texture use_texture_window
         (rgb land 0x00FFFFFF) xy uv wh
@@ -850,8 +864,7 @@ let process_command st = function
         for x = 0 to w - 1 do
           let tx = dst_x + x in
           let ty = dst_y + y in
-          if tx >= 0 && tx < vram_width && ty >= 0 && ty < vram_height then
-            st.vram.((ty * vram_width) + tx) <- temp.((y * w) + x)
+          write_vram_pixel st tx ty temp.((y * w) + x)
         done
       done
   | ImageBegin (arg0, arg1) -> begin_image_load st arg0 arg1
@@ -860,7 +873,8 @@ let process_command st = function
       st.display_x <- 0;
       st.display_y <- 0;
       st.display_w <- 320;
-      st.display_h <- 240
+      st.display_h <- 240;
+      st.mask_bit_setting <- 0
   | DrawAreaTopLeft packed ->
       st.draw_area_left <- packed land 0x3FF;
       st.draw_area_top <- (packed lsr 10) land 0x3FF
@@ -874,6 +888,7 @@ let process_command st = function
   | DrawMode word ->
       st.draw_mode <- word land 0x3FFF;
       st.dither_enabled <- word land (1 lsl 9) <> 0
+  | MaskBitSetting setting -> st.mask_bit_setting <- setting land 0x3
   | DisplayArea packed ->
       st.display_x <- packed land 0x3FF;
       st.display_y <- (packed lsr 10) land 0x1FF
