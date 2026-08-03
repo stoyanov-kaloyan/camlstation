@@ -1,3 +1,6 @@
 (test
  (name test_camlstation)
- (libraries camlstation))
+ (libraries camlstation)
+ (action
+  (setenv PATH %{env:SDL3_LIB_DIR=/usr/local/lib}
+   (run %{test}))))

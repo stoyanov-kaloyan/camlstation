@@ -614,7 +614,7 @@ let div_op =
   else if a_val = -0x80000000 && b_val = -1 then (0, -0x80000000)
   else (a_val mod b_val, a_val / b_val)
 
-let handle_bios_call (cpu : cpu) =
+let handle_tty_output (cpu : cpu) =
   if
     (cpu.pc = 0xA0 && cpu.regs.gp.(9) = 0x3C)
     || (cpu.pc = 0xB0 && cpu.regs.gp.(9) = 0x3D)
@@ -1282,4 +1282,4 @@ let step (cpu : cpu) : unit =
   let instr = parse_opcode opcode in
   let cycles = max fetch_cycles (execute cpu instr) in
   advance_timing cpu cycles;
-  handle_bios_call cpu
+  handle_tty_output cpu

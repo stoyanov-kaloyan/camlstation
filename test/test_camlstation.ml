@@ -652,6 +652,82 @@ let test_cpu_video_timing () =
   if cpu.Cpu.i_stat <> 0x1 then
     failwith "I_STAT zero-bit acknowledgement semantics are incorrect"
 
+let test_spu_adpcm_block_decode () =
+  let decode block old older =
+    let decoded = Array.make 28 0 in
+    let old = ref old and older = ref older in
+    Spu.decode_adpcm_block block decoded old older;
+    (decoded, !old, !older)
+  in
+
+  let block = Array.make 16 0 in
+  block.(0) <- 0x0C;
+  block.(2) <- 0x8F;
+  let decoded, _, _ = decode block 0 0 in
+  if decoded.(0) <> -1 || decoded.(1) <> -8 then
+    failwith "SPU ADPCM nibbles were not decoded low-first with sign extension";
+
+  let block = Array.make 16 0 in
+  block.(0) <- 0x0D;
+  block.(2) <- 0x01;
+  let decoded, _, _ = decode block 0 0 in
+  if decoded.(0) <> 8 then
+    failwith "SPU ADPCM invalid shift did not behave like shift 9";
+
+  let block = Array.make 16 0x11 in
+  block.(0) <- 0x1C;
+  block.(1) <- 0;
+  let decoded, old, older = decode block 0 0 in
+  if decoded.(0) <> 1 || decoded.(1) <> 2 || decoded.(2) <> 3 then
+    failwith "SPU ADPCM filter history was applied incorrectly";
+  if old <> decoded.(27) || older <> decoded.(26) then
+    failwith "SPU ADPCM filter history was not returned to the caller";
+
+  let block = Array.make 16 0x77 in
+  block.(0) <- 0x40;
+  block.(1) <- 0;
+  let decoded, _, _ = decode block 0x7FFF 0x7FFF in
+  if decoded.(0) <> 0x7FFF then
+    failwith "SPU ADPCM output was not saturated to signed 16-bit"
+
+let test_sample_adpcm_input () =
+    (* 48 00 D2 4D EF F0 E3 3C 1F ED F4 2F 2E EF E3 13
+  with old 392 and older = 465
+    should be decoded into
+    +343 +238 +84  +2   -90  -204 -304 -403 -434 -481 -573 -592 -606 -583
+    -590 -609 -543 -479 -419 -317 -242 -131 -38  +18  +118 +176 +273 +371*)
+    let decode block old older =
+      let decoded = Array.make 28 0 in
+      let old = ref old and older = ref older in
+      Spu.decode_adpcm_block block decoded old older;
+      (decoded, !old, !older)
+    in
+    let block = Array.make 16 0 in
+    block.(0) <- 0x48;
+    block.(1) <- 0x00;
+    block.(2) <- 0xD2;
+    block.(3) <- 0x4D;
+    block.(4) <- 0xEF;
+    block.(5) <- 0xF0;
+    block.(6) <- 0xE3;
+    block.(7) <- 0x3C;
+    block.(8) <- 0x1F;
+    block.(9) <- 0xED;
+    block.(10) <- 0xF4;
+    block.(11) <- 0x2F;
+    block.(12) <- 0x2E;
+    block.(13) <- 0xEF;
+    block.(14) <- 0xE3;
+    block.(15) <- 0x13;
+    let expected = [| 343; 238; 84; 2; -90; -204; -304; -403; -434; -481; -573;
+                      -592; -606; -583; -590; -609; -543; -479; -419; -317; -242; -131; -38; 18; 118; 176; 273; 371 |] in
+    let decoded, _, _ = decode block 392 465 in
+    for i = 0 to 27 do
+      if decoded.(i) <> expected.(i) then
+        failf "SPU ADPCM sample %d: expected %d, got %d" i expected.(i) decoded.(i)
+      done
+
+
 let () =
   test_textured_rectangles ();
   test_texture_windows ();
@@ -663,4 +739,6 @@ let () =
   test_24bpp_memory_transfer ();
   test_bios_gpustat ();
   test_bios_dma_channels ();
-  test_cpu_video_timing ()
+  test_cpu_video_timing ();
+  test_spu_adpcm_block_decode ();
+  test_sample_adpcm_input ()
